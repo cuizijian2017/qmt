@@ -51,6 +51,9 @@ def init(C):
     C.pending_orders = {}             # 待补单字典 {etf: {"shares": 股数, "days": 挂单天数}}
     C.last_trade_date = ""            # 用于每日计数去重
     C.last_rebalance_date = ""        # 用于防止调仓重复触发
+    C.day_start_equity = None           # 当日风控基准资产
+    C.risk_check_date = ""              # 当日风控基准日期
+    C.rebalance_window_minutes = 6      # 14:50 后允许触发的分钟窗口
 
     # ========== 工程防护 ==========
     C.order_lock = False              # 防重复下单锁
@@ -114,8 +117,15 @@ def load_state(C):
         C.lockdown_days_left = state.get('lockdown_days_left', 0)
         C.cooling_period_left = state.get('cooling_period_left', 0)
         C.trade_day_counter = state.get('trade_day_counter', 0)
+        C.last_trade_date = state.get('last_trade_date', '')
+        C.last_rebalance_date = state.get('last_rebalance_date', '')
+        C.day_start_equity = state.get('day_start_equity', None)
+        C.risk_check_date = state.get('risk_check_date', '')
         C.pos_scale = state.get('pos_scale', 1.0)
-        C.pending_orders = state.get('pending_orders', {})
+        C.pending_orders = normalize_pending_orders(state.get('pending_orders', {}))
+        C.target_etfs = [normalize_stock_code(x) for x in state.get('target_etfs', [])]
+        C.target_weights = state.get('target_weights', [])
+        C.last_prices = state.get('last_prices', {})
         C.order_book = state.get('order_book', {})
         C.trade_log = state.get('trade_log', [])
         print('[持久化] 状态恢复成功')
@@ -142,8 +152,15 @@ def save_state(C):
         'lockdown_days_left': C.lockdown_days_left,
         'cooling_period_left': C.cooling_period_left,
         'trade_day_counter': C.trade_day_counter,
+        'last_trade_date': C.last_trade_date,
+        'last_rebalance_date': C.last_rebalance_date,
+        'day_start_equity': C.day_start_equity,
+        'risk_check_date': C.risk_check_date,
         'pos_scale': C.pos_scale,
         'pending_orders': C.pending_orders,
+        'target_etfs': C.target_etfs,
+        'target_weights': C.target_weights,
+        'last_prices': C.last_prices,
         'order_book': C.order_book,
         'trade_log': C.trade_log
     }
@@ -166,6 +183,53 @@ def get_current_date(C):
         return dt.strftime('%Y-%m-%d')
     except:
         return datetime.datetime.now().strftime('%Y-%m-%d')
+
+
+def normalize_stock_code(stock, exchange=None):
+    """标准化 QMT 返回的证券代码，避免 SH/SSE/SHSE 等格式不一致。"""
+    if stock is None:
+        return ""
+    code = str(stock).strip().upper()
+    exch = str(exchange).strip().upper() if exchange is not None else ""
+
+    if "." in code:
+        base, suffix = code.split(".", 1)
+        code = base
+        if not exch:
+            exch = suffix
+
+    exchange_map = {
+        "SH": "SH", "SSE": "SH", "SHSE": "SH", "XSHG": "SH",
+        "SZ": "SZ", "SZSE": "SZ", "XSHE": "SZ",
+    }
+    if exch in exchange_map:
+        return code + "." + exchange_map[exch]
+    if code.startswith(("5", "6", "9")):
+        return code + ".SH"
+    if code.startswith(("0", "1", "2", "3")):
+        return code + ".SZ"
+    return code
+
+
+def normalize_pending_orders(pending_orders):
+    """恢复状态时同步规范化补单字典的证券代码。"""
+    normalized = {}
+    if not isinstance(pending_orders, dict):
+        return normalized
+    for etf, order in pending_orders.items():
+        code = normalize_stock_code(etf)
+        if code:
+            normalized[code] = order
+    return normalized
+
+
+def in_rebalance_window(C):
+    """实盘使用 14:50 后的短窗口触发，避免精确分钟错过调仓。"""
+    now = datetime.datetime.now()
+    start = now.replace(hour=14, minute=50, second=0, microsecond=0)
+    minutes = getattr(C, 'rebalance_window_minutes', 6)
+    end = start + datetime.timedelta(minutes=minutes)
+    return start <= now < end
 
 
 def get_current_price(C, stock):
@@ -196,7 +260,7 @@ def get_positions(C):
         for pos in pos_list:
             try:
                 if pos.m_nVolume > 0:
-                    code = pos.m_strInstrumentID + '.' + pos.m_strExchangeID
+                    code = normalize_stock_code(pos.m_strInstrumentID, pos.m_strExchangeID)
                     price = pos.m_dLastPrice
                     if price is None or price <= 0:
                         continue
@@ -240,8 +304,89 @@ def get_total_value(C):
 
 
 # ==================== 统一下单入口 ====================
+def get_obj_attr(obj, names, default=None):
+    for name in names:
+        if hasattr(obj, name):
+            value = getattr(obj, name)
+            if value is not None:
+                return value
+    return default
+
+
+def normalize_order_status(raw_status, filled, total):
+    status_map = {
+        48: "pending",
+        49: "pending",
+        50: "submitted",
+        51: "canceling",
+        52: "partial_canceling",
+        53: "partial_canceled",
+        54: "canceled",
+        55: "partial_filled",
+        56: "filled",
+        57: "rejected",
+    }
+    try:
+        raw_int = int(raw_status)
+        status = status_map.get(raw_int, str(raw_status))
+    except:
+        status = str(raw_status).lower() if raw_status is not None else "unknown"
+
+    try:
+        filled_num = int(filled or 0)
+        total_num = int(total or 0)
+    except:
+        filled_num, total_num = 0, 0
+
+    if total_num > 0 and filled_num >= total_num:
+        return "filled"
+    if filled_num > 0 and status in ("submitted", "pending", "unknown"):
+        return "partial_filled"
+    return status
+
+
+def sync_order_book(C):
+    """尽量同步 QMT 委托状态，避免把提交委托误认为已成交。"""
+    try:
+        orders = get_trade_detail_data(C.account, C.acct_type, 'order')
+    except Exception as e:
+        print('[订单同步] 获取委托失败:', e)
+        return
+    if not orders or not getattr(C, 'order_book', None):
+        return
+
+    for order in orders:
+        try:
+            ids = set()
+            for attr in ['m_strOrderSysID', 'm_strOrderID', 'm_strOrderRef', 'm_strOrderLocalID']:
+                value = get_obj_attr(order, [attr], None)
+                if value not in (None, ''):
+                    ids.add(str(value))
+
+            code = normalize_stock_code(
+                get_obj_attr(order, ['m_strInstrumentID', 'm_strStockCode'], ''),
+                get_obj_attr(order, ['m_strExchangeID', 'm_strExchange'], '')
+            )
+            filled = get_obj_attr(order, ['m_nVolumeTraded', 'm_nTradedVolume', 'm_nVolumeTrade'], 0)
+            total = get_obj_attr(order, ['m_nVolumeTotalOriginal', 'm_nOrderVolume', 'm_nVolumeTotal'], 0)
+            raw_status = get_obj_attr(order, ['m_nOrderStatus', 'm_strOrderStatus', 'm_nStatus'], None)
+            status = normalize_order_status(raw_status, filled, total)
+
+            for order_id, record in list(C.order_book.items()):
+                if str(order_id) in ids:
+                    record['filled'] = int(filled or 0)
+                    record['status'] = status
+                    record['last_sync_time'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        except Exception as e:
+            print('[订单同步] 解析委托失败:', e)
+
+
 def safe_order(C, side, etf, volume, remark):
     """执行交易指令并登记到订单簿中"""
+    etf = normalize_stock_code(etf)
+    volume = int(volume / 100) * 100
+    if volume < 100:
+        return None
     try:
         order_id = passorder(
             C.buy_code if side == 'buy' else C.sell_code,
@@ -256,8 +401,11 @@ def safe_order(C, side, etf, volume, remark):
                 "volume": volume,
                 "filled": 0,
                 "status": "submitted",
+                "remark": remark,
                 "time": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             }
+        else:
+            print('[下单失败] 未返回订单号:', etf, side, volume, remark)
         return order_id
     except Exception as e:
         print("[下单失败]", e)
@@ -315,19 +463,25 @@ def compute_targets(C, current_date):
     ser = pd.Series(returns).sort_values(ascending=False)
     print('[%s] 动量评分: %s' % (current_date, ser.head(3).to_dict()))
 
-    if ser.iloc[0] <= 0:
+    positive = ser[ser > 0]
+    if positive.empty:
         print('[%s] [无正向动量] 全配避险国债' % current_date)
         return ['511010.SH'], [1.0]
-    else:
-        target_etfs = ser.head(C.min_holdings).index.tolist()
-        momentums = ser.head(C.min_holdings).values
-        total_mom = sum(momentums)
-        return target_etfs, [m / total_mom for m in momentums]
+
+    selected = positive.head(C.min_holdings)
+    total_mom = float(selected.sum())
+    if total_mom <= 0:
+        print('[%s] [权重异常] 全配避险国债' % current_date)
+        return ['511010.SH'], [1.0]
+
+    target_etfs = selected.index.tolist()
+    target_weights = [float(m / total_mom) for m in selected.values]
+    return target_etfs, target_weights
 
 
 # ==================== 交易主执行 ====================
 def execute_trades(C, current_date):
-    """执行调仓动作并更新理论可用资金"""
+    """执行调仓动作，并以真实账户现金为准登记补单。"""
     now = datetime.datetime.now()
     if C.order_lock and C.order_lock_time:
         if (now - C.order_lock_time).seconds < 5:
@@ -336,30 +490,48 @@ def execute_trades(C, current_date):
     C.order_lock_time = now
 
     try:
+        sync_order_book(C)
         positions = get_positions(C)
         target_set = set(C.target_etfs)
         total_value = get_total_value(C) * C.pos_scale
 
         print('[%s] 正在执行调仓指令提交...' % current_date)
-        theoretical_cash = get_available_cash(C)
         traded_today = set()
 
-        # 1. 卖出非目标
+        # 1. 先提交卖单，但不预支未确认成交的卖出资金。
         for etf, pos in list(positions.items()):
-            if etf not in target_set:
-                price = get_current_price(C, etf)
-                if price <= 0:
-                    continue
-                vol = int(pos["shares"] / 100) * 100
-                if vol >= 100:
-                    print('[%s] 卖出非目标: %s, %d 股' % (current_date, etf, vol))
-                    safe_order(C, 'sell', etf, vol, '清仓非目标')
-                    theoretical_cash += (vol * price) * 0.998  # 资金回笼
-                    traded_today.add(etf)
+            price = get_current_price(C, etf)
+            if price <= 0:
+                continue
+            vol = int(pos["shares"] / 100) * 100
+            if vol < 100:
+                continue
 
-        # 2. 买入新目标
+            if etf not in target_set:
+                print('[%s] 卖出非目标: %s, %d 股' % (current_date, etf, vol))
+                safe_order(C, 'sell', etf, vol, '清仓非目标')
+                traded_today.add(etf)
+                continue
+
+            try:
+                idx = C.target_etfs.index(etf)
+                target_value = total_value * C.target_weights[idx]
+                target_shares = int(target_value / price / 100) * 100
+                delta = target_shares - pos["shares"]
+                if delta < -99:
+                    sell_vol = int(abs(delta) / 100) * 100
+                    print('[%s] 卖出减仓: %s, %d 股' % (current_date, etf, sell_vol))
+                    safe_order(C, 'sell', etf, sell_vol, '调仓卖出')
+                    traded_today.add(etf)
+            except Exception as e:
+                print('[%s] [减仓计算失败] %s: %s' % (current_date, etf, e))
+
+        sync_order_book(C)
+        available_cash = get_available_cash(C)
+
+        # 2. 买入目标时只使用账户真实可用资金，未成交卖单产生的资金进入后续补单。
         for i, etf in enumerate(C.target_etfs):
-            if etf in traded_today:
+            if etf in traded_today and etf not in positions:
                 continue
 
             target_value = total_value * C.target_weights[i]
@@ -367,42 +539,37 @@ def execute_trades(C, current_date):
                 continue
             price = C.last_prices.get(etf, 0)
             if price <= 0:
+                price = get_current_price(C, etf)
+            if price <= 0:
                 continue
 
             current_shares = positions.get(etf, {}).get("shares", 0)
             target_shares = int(target_value / price / 100) * 100
             delta = target_shares - current_shares
-
-            if abs(delta) < 100:
+            if delta < 100:
                 continue
 
-            if delta > 0:  # 需补足头寸
-                cost = delta * price * 1.02
-                if cost > theoretical_cash:
-                    # 现金受限，先进行部分买入
-                    max_shares = int(theoretical_cash * 0.98 / price / 100) * 100
-                    if max_shares >= 100:
-                        print('[%s] [现金受限] %s 优先买入 %d 股' % (current_date, etf, max_shares))
-                        safe_order(C, 'buy', etf, max_shares, '调仓部分买入')
-                        theoretical_cash -= (max_shares * price * 1.02)
+            max_affordable = int(available_cash * 0.98 / price / 100) * 100
+            buy_vol = min(delta, max_affordable)
+            submitted_buy = 0
+            if buy_vol >= 100:
+                remark = '调仓买入' if buy_vol == delta else '调仓部分买入'
+                print('[%s] 买入建仓: %s, %d 股' % (current_date, etf, buy_vol))
+                order_id = safe_order(C, 'buy', etf, buy_vol, remark)
+                if order_id:
+                    submitted_buy = buy_vol
+                    available_cash -= buy_vol * price * 1.02
 
-                        remaining = delta - max_shares
-                        if remaining >= 100:
-                            if etf in C.pending_orders:
-                                C.pending_orders[etf]["shares"] += remaining
-                            else:
-                                C.pending_orders[etf] = {"shares": remaining, "days": 0}
-                            print('[%s] 登记补单: %s 缺额 %d 股' % (current_date, etf, remaining))
+            remaining = delta - submitted_buy
+            if remaining >= 100:
+                if etf in C.pending_orders:
+                    C.pending_orders[etf]["shares"] += remaining
                 else:
-                    print('[%s] 买入建仓: %s, %d 股' % (current_date, etf, delta))
-                    safe_order(C, 'buy', etf, delta, '调仓买入')
-                    theoretical_cash -= cost
-            elif delta < 0:  # 仓位多余
-                print('[%s] 卖出减仓: %s, %d 股' % (current_date, etf, abs(delta)))
-                safe_order(C, 'sell', etf, abs(delta), '调仓卖出')
+                    C.pending_orders[etf] = {"shares": remaining, "days": 0}
+                print('[%s] 登记补单: %s 缺额 %d 股' % (current_date, etf, remaining))
 
-        # 将最终资金结果写回缓存中
-        C.last_cash = theoretical_cash
+        sync_order_book(C)
+        C.last_cash = get_available_cash(C)
 
     finally:
         C.order_lock = False
@@ -436,16 +603,18 @@ def execute_pending_orders(C, current_date):
         cost = need_shares * price * 1.02
         if available_cash >= cost:
             print('[%s] [补单] 满足条件，补全剩余 %s, %d 股' % (current_date, etf, need_shares))
-            safe_order(C, 'buy', etf, need_shares, '补单完成')
-            available_cash -= cost
-            expired.append(etf)
+            order_id = safe_order(C, 'buy', etf, need_shares, '补单完成')
+            if order_id:
+                available_cash -= cost
+                expired.append(etf)
         else:
             max_shares = int(available_cash * 0.98 / price / 100) * 100
             if max_shares >= 100:
                 print('[%s] [补单] 资金不足，先补 %d 股' % (current_date, etf, max_shares))
-                safe_order(C, 'buy', etf, max_shares, '补单部分')
-                available_cash -= (max_shares * price * 1.02)
-                order["shares"] -= max_shares
+                order_id = safe_order(C, 'buy', etf, max_shares, '补单部分')
+                if order_id:
+                    available_cash -= (max_shares * price * 1.02)
+                    order["shares"] -= max_shares
 
                 order["days"] = order.get("days", 0) + 1
                 if order["days"] > 5:
@@ -509,25 +678,44 @@ def handlebar(C):
     current_date = get_current_date(C)
     is_backtest = getattr(C, 'do_back_test', False)
 
-    # 1. 资产突降熔断保护
-    now_val = get_total_value(C)
-    if C.last_equity is not None and now_val > 0:
-        if now_val < C.last_equity * 0.85:
-            print('[%s] [熔断] 单日资产回撤超15%%，停止交易' % current_date)
-            return
-    C.last_equity = now_val
+    sync_order_book(C)
 
-    # 2. 每日开盘时段状态更新与补单处理
+    # 1. 每日资产熔断和账户最大回撤检查，每个交易日都执行。
+    now_val = get_total_value(C)
+    if getattr(C, 'risk_check_date', '') != current_date:
+        C.risk_check_date = current_date
+        C.day_start_equity = now_val if now_val and now_val > 0 else None
+    elif getattr(C, 'day_start_equity', None) is None and now_val and now_val > 0:
+        C.day_start_equity = now_val
+
+    day_start_equity = getattr(C, 'day_start_equity', None)
+    if day_start_equity and now_val and now_val > 0:
+        if now_val < day_start_equity * 0.85:
+            print('[%s] [熔断] 当日资产回撤超15%%，停止交易' % current_date)
+            save_state(C)
+            return
+
+    if now_val and now_val > 100:
+        if C.watermark is None or now_val > C.watermark:
+            C.watermark = now_val
+        dd = (now_val - C.watermark) / C.watermark if C.watermark else 0
+        if dd < -C.drawdown_limit and not C.in_lockdown:
+            print('[%s] [风控] 账户回撤 %.2f%% 破线，强制止损' % (current_date, dd * 100))
+            trigger_lockdown(C, current_date)
+            save_state(C)
+            return
+
+    # 2. 每日开盘时段状态更新与补单处理，重启后依赖持久化日期防止重复计数。
     if getattr(C, 'last_trade_date', '') != current_date:
         C.last_trade_date = current_date
         C.trade_day_counter += 1
         if not is_backtest and not C.in_lockdown and C.cooling_period_left <= 0:
             execute_pending_orders(C, current_date)
+        save_state(C)
 
-    # 3. 调仓触发条件过滤
+    # 3. 调仓触发条件过滤：实盘使用 14:50 后短窗口，当天只处理一次。
     if not is_backtest:
-        now = datetime.datetime.now()
-        if not (now.hour == 14 and now.minute == 50):
+        if not in_rebalance_window(C):
             return
         if getattr(C, 'last_rebalance_date', '') == current_date:
             return
@@ -563,20 +751,7 @@ def handlebar(C):
 
     print('[%s] --- 进入周期调仓流程 ---' % current_date)
 
-    # 7. 水线更新与整体最大回撤止损
-    total_value = get_total_value(C)
-    if C.watermark is None or total_value > C.watermark:
-        if total_value > 100:
-            C.watermark = total_value
-
-    dd = (total_value - C.watermark) / C.watermark if C.watermark else 0
-    if dd < -C.drawdown_limit:
-        print('[%s] [风控] 账户回撤 %.2f%% 破线，强制止损' % (current_date, dd * 100))
-        trigger_lockdown(C, current_date)
-        save_state(C)
-        return
-
-    # 8. 仓位管理与调仓执行
+    # 7. 仓位管理与调仓执行
     C.pos_scale = calculate_position_scale(C, current_date)
     C.target_etfs, C.target_weights = compute_targets(C, current_date)
 
