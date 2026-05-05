@@ -517,6 +517,8 @@ def request_cancel_order(C, order_id, order):
 
 def cancel_stale_orders(C, current_date, force=False):
     """超时未成交委托先撤单，避免后续重复下单造成超买/超卖。"""
+    if getattr(C, 'do_back_test', False):
+        return False
     sync_order_book(C)
     changed = archive_final_orders(C, current_date)
     now = datetime.datetime.now()
@@ -606,9 +608,17 @@ def safe_order(C, side, etf, volume, remark):
                 "archived": False,
                 "time": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             }
-        else:
-            print('[下单失败] 未返回订单号:', etf, side, volume, remark)
-        return order_id
+            return order_id
+
+        if getattr(C, 'do_back_test', False):
+            # QMT 回测环境常见行为：passorder 已提交给回测撮合，但不返回订单号。
+            # 回测不依赖本地订单生命周期，返回合成 ID 仅用于阻止误登记补单。
+            synthetic_id = 'BACKTEST_%s_%s_%s' % (side, etf, getattr(C, 'barpos', ''))
+            print('[回测下单] 未返回订单号，按已提交处理: %s %s %d 股' % (side, etf, volume))
+            return synthetic_id
+
+        print('[下单失败] 未返回订单号:', etf, side, volume, remark)
+        return None
     except Exception as e:
         print("[下单失败]", e)
         return None
