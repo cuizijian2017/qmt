@@ -1,0 +1,11 @@
+# Runtime logs and local state are machine-specific.
+logs/*
+state/*
+
+# Keep directory placeholders in git.
+!logs/.gitkeep
+!state/.gitkeep
+
+# Python cache files.
+__pycache__/
+*.py[cod]
