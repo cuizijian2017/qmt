@@ -64,6 +64,7 @@ def init(C):
     C.order_book = {}                 # 订单簿
     C.trade_log = []                  # 成交记录
     C.order_timeout_seconds = 90      # 普通委托超时撤单阈值
+    C.log_backtest_orders = False      # 回测下单日志默认关闭，避免刷屏
 
     # ========== 交易账户设置 ==========
     C.account = '2064890'             # 请替换为实盘/模拟账号
@@ -437,6 +438,8 @@ def has_active_order(C, etf, side=None):
 
 
 def add_pending_order(C, etf, shares, reason, current_date, order_id=None):
+    if getattr(C, 'do_back_test', False):
+        return
     etf = normalize_stock_code(etf)
     shares = int(shares / 100) * 100
     if shares < 100:
@@ -614,7 +617,8 @@ def safe_order(C, side, etf, volume, remark):
             # QMT 回测环境常见行为：passorder 已提交给回测撮合，但不返回订单号。
             # 回测不依赖本地订单生命周期，返回合成 ID 仅用于阻止误登记补单。
             synthetic_id = 'BACKTEST_%s_%s_%s' % (side, etf, getattr(C, 'barpos', ''))
-            print('[回测下单] 未返回订单号，按已提交处理: %s %s %d 股' % (side, etf, volume))
+            if getattr(C, 'log_backtest_orders', False):
+                print('[回测下单] 未返回订单号，按已提交处理: %s %s %d 股' % (side, etf, volume))
             return synthetic_id
 
         print('[下单失败] 未返回订单号:', etf, side, volume, remark)
