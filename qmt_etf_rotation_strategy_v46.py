@@ -63,6 +63,7 @@ def init(C):
     C.order_lock_time = None          # 锁时间
     C.order_book = {}                 # 订单簿
     C.trade_log = []                  # 成交记录
+    C.order_timeout_seconds = 90      # 普通委托超时撤单阈值
 
     # ========== 交易账户设置 ==========
     C.account = '2064890'             # 请替换为实盘/模拟账号
@@ -371,7 +372,23 @@ def normalize_order_status(raw_status, filled, total):
         raw_int = int(raw_status)
         status = status_map.get(raw_int, str(raw_status))
     except:
-        status = str(raw_status).lower() if raw_status is not None else "unknown"
+        status = str(raw_status).strip().lower() if raw_status is not None else "unknown"
+        text_status_map = {
+            "已报": "submitted",
+            "未成交": "submitted",
+            "部成": "partial_filled",
+            "部分成交": "partial_filled",
+            "待撤": "canceling",
+            "部成待撤": "partial_canceling",
+            "已撤": "canceled",
+            "部撤": "partial_canceled",
+            "部分撤单": "partial_canceled",
+            "已成": "filled",
+            "全部成交": "filled",
+            "废单": "rejected",
+            "拒单": "rejected",
+        }
+        status = text_status_map.get(status, status)
 
     try:
         filled_num = int(filled or 0)
@@ -384,6 +401,144 @@ def normalize_order_status(raw_status, filled, total):
     if filled_num > 0 and status in ("submitted", "pending", "unknown"):
         return "partial_filled"
     return status
+
+
+def is_active_order_status(status):
+    status = str(status or '').strip().lower()
+    if status in ('filled', 'canceled', 'partial_canceled', 'rejected', 'expired', 'stale_unknown'):
+        return False
+    return status in ('submitted', 'pending', 'partial_filled', 'canceling', 'partial_canceling', 'unknown')
+
+
+def is_final_order_status(status):
+    status = str(status or '').lower()
+    return status in ('filled', 'canceled', 'partial_canceled', 'rejected', 'expired', 'stale_unknown')
+
+
+def parse_order_time(value):
+    if not value:
+        return None
+    try:
+        return datetime.datetime.strptime(value, '%Y-%m-%d %H:%M:%S')
+    except:
+        return None
+
+
+def has_active_order(C, etf, side=None):
+    etf = normalize_stock_code(etf)
+    for order_id, order in getattr(C, 'order_book', {}).items():
+        if order.get('etf') != etf:
+            continue
+        if side and order.get('side') != side:
+            continue
+        if is_active_order_status(order.get('status')):
+            return str(order_id), order
+    return None, None
+
+
+def add_pending_order(C, etf, shares, reason, current_date, order_id=None):
+    etf = normalize_stock_code(etf)
+    shares = int(shares / 100) * 100
+    if shares < 100:
+        return
+    if etf not in C.pending_orders:
+        C.pending_orders[etf] = {
+            "shares": shares,
+            "days": 0,
+            "reason": reason,
+            "source_rebalance_date": current_date,
+            "last_order_id": str(order_id) if order_id else "",
+            "attempt_count": 0
+        }
+    else:
+        C.pending_orders[etf]["shares"] += shares
+        C.pending_orders[etf]["reason"] = reason
+        if order_id:
+            C.pending_orders[etf]["last_order_id"] = str(order_id)
+    print('[%s] 登记补单: %s 缺额 %d 股，原因: %s' % (current_date, etf, shares, reason))
+
+
+def archive_final_orders(C, current_date):
+    """订单终态不删除，只标记归档；买单剩余部分转入补单。"""
+    changed = False
+    for order_id, order in list(getattr(C, 'order_book', {}).items()):
+        if order.get('archived'):
+            continue
+        status = str(order.get('status', '')).lower()
+        if not is_final_order_status(status):
+            continue
+        order['archived'] = True
+        order['archive_time'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        changed = True
+
+        etf = order.get('etf')
+        side = order.get('side')
+        volume = int(order.get('volume', 0) or 0)
+        filled = int(order.get('filled', 0) or 0)
+        remaining = int((volume - filled) / 100) * 100
+        if side == 'buy' and remaining >= 100 and etf in getattr(C, 'target_etfs', []) and not getattr(C, 'in_lockdown', False):
+            add_pending_order(C, etf, remaining, 'order_' + status, current_date, order_id)
+            changed = True
+    return changed
+
+
+def request_cancel_order(C, order_id, order):
+    """兼容不同 QMT 环境的撤单入口；找不到接口时只记录，不假装已撤。"""
+    candidates = ['cancel', 'cancelorder', 'cancel_order']
+    last_error = ''
+    for name in candidates:
+        fn = globals().get(name)
+        if fn is None:
+            continue
+        signatures = [
+            (order_id, C.account, C.acct_type, C),
+            (C.account, C.acct_type, order_id, C),
+            (C.account, order_id, C),
+            (order_id, C),
+            (order_id,)
+        ]
+        for args in signatures:
+            try:
+                result = fn(*args)
+                order['cancel_requested'] = True
+                order['cancel_request_time'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                order['status'] = 'canceling'
+                return True
+            except TypeError as e:
+                last_error = str(e)
+                continue
+            except Exception as e:
+                last_error = str(e)
+                break
+    order['cancel_error'] = last_error or 'cancel api not found'
+    print('[撤单失败] 未能提交撤单: %s, %s, %s' % (order_id, order.get('etf'), order.get('cancel_error')))
+    return False
+
+
+def cancel_stale_orders(C, current_date, force=False):
+    """超时未成交委托先撤单，避免后续重复下单造成超买/超卖。"""
+    sync_order_book(C)
+    changed = archive_final_orders(C, current_date)
+    now = datetime.datetime.now()
+    timeout = getattr(C, 'order_timeout_seconds', 90)
+
+    for order_id, order in list(getattr(C, 'order_book', {}).items()):
+        if not is_active_order_status(order.get('status')):
+            continue
+        if order.get('cancel_requested') and str(order.get('status')).lower() in ('canceling', 'partial_canceling'):
+            continue
+        submit_time = parse_order_time(order.get('time'))
+        elapsed = (now - submit_time).total_seconds() if submit_time else timeout + 1
+        if not force and elapsed < timeout:
+            continue
+        print('[%s] [委托超时] 准备撤单: %s %s %s %s 股' % (
+            current_date, order_id, order.get('side'), order.get('etf'), order.get('volume')
+        ))
+        if request_cancel_order(C, order_id, order):
+            changed = True
+    if changed:
+        save_state(C)
+    return changed
 
 
 def sync_order_book(C):
@@ -428,6 +583,10 @@ def safe_order(C, side, etf, volume, remark):
     volume = int(volume / 100) * 100
     if volume < 100:
         return None
+    active_id, active_order = has_active_order(C, etf, side)
+    if active_id:
+        print('[下单跳过] 已有活跃委托: %s %s %s %s 股' % (active_id, side, etf, active_order.get('volume')))
+        return None
     try:
         order_id = passorder(
             C.buy_code if side == 'buy' else C.sell_code,
@@ -443,6 +602,8 @@ def safe_order(C, side, etf, volume, remark):
                 "filled": 0,
                 "status": "submitted",
                 "remark": remark,
+                "cancel_requested": False,
+                "archived": False,
                 "time": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             }
         else:
@@ -523,7 +684,7 @@ def execute_trades(C, current_date):
     C.order_lock_time = now
 
     try:
-        sync_order_book(C)
+        cancel_stale_orders(C, current_date)
         positions = get_positions(C)
         if positions is None:
             print('[%s] [账户异常] 无法获取持仓，跳过本次调仓' % current_date)
@@ -548,6 +709,10 @@ def execute_trades(C, current_date):
                 continue
 
             if etf not in target_set:
+                if has_active_order(C, etf, 'sell')[0]:
+                    print('[%s] 已有卖出活跃委托，跳过重复清仓: %s' % (current_date, etf))
+                    traded_today.add(etf)
+                    continue
                 print('[%s] 卖出非目标: %s, %d 股' % (current_date, etf, vol))
                 safe_order(C, 'sell', etf, vol, '清仓非目标')
                 traded_today.add(etf)
@@ -560,6 +725,10 @@ def execute_trades(C, current_date):
                 delta = target_shares - pos["shares"]
                 if delta < -99:
                     sell_vol = int(abs(delta) / 100) * 100
+                    if has_active_order(C, etf, 'sell')[0]:
+                        print('[%s] 已有卖出活跃委托，跳过重复减仓: %s' % (current_date, etf))
+                        traded_today.add(etf)
+                        continue
                     print('[%s] 卖出减仓: %s, %d 股' % (current_date, etf, sell_vol))
                     safe_order(C, 'sell', etf, sell_vol, '调仓卖出')
                     traded_today.add(etf)
@@ -592,6 +761,10 @@ def execute_trades(C, current_date):
             if delta < 100:
                 continue
 
+            if has_active_order(C, etf, 'buy')[0]:
+                print('[%s] 已有买入活跃委托，跳过重复买入: %s' % (current_date, etf))
+                continue
+
             max_affordable = int(available_cash * 0.98 / price / 100) * 100
             buy_vol = min(delta, max_affordable)
             submitted_buy = 0
@@ -605,11 +778,7 @@ def execute_trades(C, current_date):
 
             remaining = delta - submitted_buy
             if remaining >= 100:
-                if etf in C.pending_orders:
-                    C.pending_orders[etf]["shares"] += remaining
-                else:
-                    C.pending_orders[etf] = {"shares": remaining, "days": 0}
-                print('[%s] 登记补单: %s 缺额 %d 股' % (current_date, etf, remaining))
+                add_pending_order(C, etf, remaining, 'cash_limited_or_unsubmitted', current_date)
 
         sync_order_book(C)
         latest_cash = get_available_cash(C)
@@ -627,6 +796,7 @@ def execute_pending_orders(C, current_date):
     if not C.pending_orders:
         return
 
+    cancel_stale_orders(C, current_date)
     print('[%s] [补单] 检查未成交补单...' % current_date)
     available_cash = get_available_cash(C)
     if available_cash is None:
@@ -649,11 +819,18 @@ def execute_pending_orders(C, current_date):
             expired.append(etf)
             continue
 
+        if has_active_order(C, etf, 'buy')[0]:
+            print('[%s] [补单] 已有买入活跃委托，跳过重复补单: %s' % (current_date, etf))
+            continue
+
         cost = need_shares * price * 1.02
+        order["last_attempt_time"] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        order["attempt_count"] = order.get("attempt_count", 0) + 1
         if available_cash >= cost:
             print('[%s] [补单] 满足条件，补全剩余 %s, %d 股' % (current_date, etf, need_shares))
             order_id = safe_order(C, 'buy', etf, need_shares, '补单完成')
             if order_id:
+                order["last_order_id"] = str(order_id)
                 available_cash -= cost
                 expired.append(etf)
         else:
@@ -662,6 +839,7 @@ def execute_pending_orders(C, current_date):
                 print('[%s] [补单] 资金不足，先补 %d 股' % (current_date, etf, max_shares))
                 order_id = safe_order(C, 'buy', etf, max_shares, '补单部分')
                 if order_id:
+                    order["last_order_id"] = str(order_id)
                     available_cash -= (max_shares * price * 1.02)
                     order["shares"] -= max_shares
 
@@ -682,6 +860,7 @@ def execute_pending_orders(C, current_date):
 # ==================== 风控执行 ====================
 def submit_lockdown_liquidation(C, current_date):
     """空仓保护期间持续确认并提交清仓委托。"""
+    cancel_stale_orders(C, current_date)
     positions = get_positions(C)
     if positions is None:
         print('[%s] [风控] 无法确认持仓，保持空仓保护并等待下次检查' % current_date)
@@ -697,6 +876,9 @@ def submit_lockdown_liquidation(C, current_date):
         if price > 0:
             vol = int(pos["shares"] / 100) * 100
             if vol >= 100:
+                if has_active_order(C, etf, 'sell')[0]:
+                    print('[%s] [风控] 已有清仓活跃委托，跳过重复提交: %s' % (current_date, etf))
+                    continue
                 safe_order(C, 'sell', etf, vol, '空仓保护')
     C.last_lockdown_order_date = current_date
     return True
@@ -735,7 +917,7 @@ def handlebar(C):
     is_backtest = getattr(C, 'do_back_test', False)
 
     if not is_backtest:
-        sync_order_book(C)
+        cancel_stale_orders(C, current_date)
 
     # 1. 账户数据异常时直接停止，避免使用旧缓存继续交易。
     now_val = get_total_value(C)
