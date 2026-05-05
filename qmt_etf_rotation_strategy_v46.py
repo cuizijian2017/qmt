@@ -1,5 +1,5 @@
-#coding:gbk
-# ÎÈ½¡°æ ETF Ç÷ÊÆÂÖ¶¯²ßÂÔ v4.6 ±ê×¼ÊµÅÌ°æ£¨Ê±ÇøĞŞ¸´+ÈÕÖ¾ÍêÉÆ£©
+# -*- coding: utf-8 -*-
+# ç¨³å¥ç‰ˆ ETF è¶‹åŠ¿è½®åŠ¨ç­–ç•¥ v4.6 æ ‡å‡†å®ç›˜ç‰ˆï¼ˆæ—¶åŒºä¿®å¤+æ—¥å¿—å®Œå–„ï¼‰
 import numpy as np
 import pandas as pd
 import datetime
@@ -7,68 +7,67 @@ import json
 import os
 import glob
 
-
 def init(C):
-    # ========== ±êµÄ³Ø ==========
+    # ========== æ ‡çš„æ±  ==========
     C.equity_etfs = [
-        '510300.SH',   # »¦Éî300ETF
-        '159915.SZ',   # ´´Òµ°åETF
-        '513100.SH',   # ÄÉÖ¸ETF
-        '518880.SH',   # »Æ½ğETF
-        '159985.SZ',   # ¶¹ÆÉETF
-        '159388.SZ'    # ÈË¹¤ÖÇÄÜETF
+        '510300.SH',   # æ²ªæ·±300ETF
+        '159915.SZ',   # åˆ›ä¸šæ¿ETF
+        '513100.SH',   # çº³æŒ‡ETF
+        '518880.SH',   # é»„é‡‘ETF
+        '159985.SZ',   # è±†ç²•ETF
+        '159388.SZ'    # äººå·¥æ™ºèƒ½ETF
     ]
     C.defense_etfs = [
-        '512890.SH',   # ºìÀûµÍ²¨ETF
-        '511010.SH'    # ¹úÕ®ETF
+        '512890.SH',   # çº¢åˆ©ä½æ³¢ETF
+        '511010.SH'    # å›½å€ºETF
     ]
     C.all_etfs = C.equity_etfs + C.defense_etfs
 
-    # ========== ºËĞÄ²ÎÊı ==========
-    C.momentum_window_short = 16      # ¶ÌÆÚ¶¯Á¿´°¿Ú
-    C.momentum_window_long = 19       # ³¤ÆÚ¶¯Á¿´°¿Ú
-    C.ma_window = 70                  # ¾ùÏß¹ıÂË´°¿Ú
-    C.rebalance_freq = 19             # µ÷²ÖÆµÂÊ£¨½»Ò×ÈÕ£©
-    C.min_holdings = 2                # ×îÉÙ³ÖÓĞETFÊıÁ¿
+    # ========== æ ¸å¿ƒå‚æ•° ==========
+    C.momentum_window_short = 16      # çŸ­æœŸåŠ¨é‡çª—å£
+    C.momentum_window_long  = 19      # é•¿æœŸåŠ¨é‡çª—å£
+    C.ma_window = 70                  # å‡çº¿è¿‡æ»¤çª—å£
+    C.rebalance_freq = 19             # è°ƒä»“é¢‘ç‡ï¼ˆäº¤æ˜“æ—¥ï¼‰
+    C.min_holdings = 2                # æœ€å°‘æŒæœ‰ETFæ•°é‡
 
-    # ========== ·ç¿Ø²ÎÊı ==========
-    C.drawdown_limit = 0.20           # »Ø³·Ö¹ËğãĞÖµ 20%
-    C.watermark = None                # ÕË»§ÀúÊ·×î¸ß¾»Öµ
-    C.in_lockdown = False             # ÊÇ·ñ´¦ÓÚ¿Õ²Ö±£»¤ÆÚ
-    C.lockdown_days_left = 0          # ¿Õ²Ö±£»¤Ê£ÓàÌìÊı
-    C.lockdown_length = 10            # ¿Õ²Ö±£»¤×ÜÌìÊı
-    C.cooling_period_left = 0         # ¼±µøÀäÈ´Ê£ÓàÌìÊı
-    C.cooling_length = 6              # ÀäÈ´ÆÚ×ÜÌìÊı
-    C.vol_lookback = 20               # ²¨¶¯ÂÊ¼ÆËã´°¿Ú
-    C.vol_threshold = 0.34            # ²¨¶¯ÂÊãĞÖµ
-    C.pos_scale = 1.0                 # ²ÖÎ»Ëõ·ÅÏµÊı
+    # ========== é£æ§å‚æ•° ==========
+    C.drawdown_limit = 0.20           # å›æ’¤æ­¢æŸé˜ˆå€¼ 20%
+    C.watermark = None                # è´¦æˆ·å†å²æœ€é«˜å‡€å€¼
+    C.in_lockdown = False             # æ˜¯å¦å¤„äºç©ºä»“ä¿æŠ¤æœŸ
+    C.lockdown_days_left = 0          # ç©ºä»“ä¿æŠ¤å‰©ä½™å¤©æ•°
+    C.lockdown_length = 10            # ç©ºä»“ä¿æŠ¤æ€»å¤©æ•°
+    C.cooling_period_left = 0         # æ€¥è·Œå†·å´å‰©ä½™å¤©æ•°
+    C.cooling_length = 6              # å†·å´æœŸæ€»å¤©æ•°
+    C.vol_lookback = 20               # æ³¢åŠ¨ç‡è®¡ç®—çª—å£
+    C.vol_threshold = 0.34            # æ³¢åŠ¨ç‡é˜ˆå€¼
+    C.pos_scale = 1.0                 # ä»“ä½ç¼©æ”¾ç³»æ•°
 
-    C.last_equity = None              # ÉÏ´Î×Ü×Ê²ú£¨ÓÃÓÚ×Ê²úÒì³£ÈÛ¶Ï£©
-    C.last_cash = None                # ÉÏ´Î¿ÉÓÃ×Ê½ğ£¨ÓÃÓÚ»º´æ»Ö¸´£©
-    C.last_prices = {}                # »º´æ×îĞÂ¼Û¸ñ
-    C.target_etfs = []                # Ä¿±ê³Ö²ÖETFÁĞ±í
-    C.target_weights = []             # ¶ÔÓ¦È¨ÖØ
-    C.trade_day_counter = 0           # ½»Ò×ÈÕ¼ÆÊıÆ÷
-    C.pending_orders = {}             # ´ı²¹µ¥×Öµä {etf: {"shares": ¹ÉÊı, "days": ¹Òµ¥ÌìÊı}}
-    C.last_trade_date = ""            # ÓÃÓÚÃ¿ÈÕ¼ÆÊıÈ¥ÖØ
-    C.last_rebalance_date = ""        # ÓÃÓÚ·ÀÖ¹µ÷²ÖÖØ¸´´¥·¢
+    C.last_equity = None              # ä¸Šæ¬¡æ€»èµ„äº§ï¼ˆç”¨äºèµ„äº§å¼‚å¸¸ç†”æ–­ï¼‰
+    C.last_cash = None                # ä¸Šæ¬¡å¯ç”¨èµ„é‡‘ï¼ˆç”¨äºç¼“å­˜æ¢å¤ï¼‰
+    C.last_prices = {}                # ç¼“å­˜æœ€æ–°ä»·æ ¼
+    C.target_etfs = []                # ç›®æ ‡æŒä»“ETFåˆ—è¡¨
+    C.target_weights = []             # å¯¹åº”æƒé‡
+    C.trade_day_counter = 0           # äº¤æ˜“æ—¥è®¡æ•°å™¨
+    C.pending_orders = {}             # å¾…è¡¥å•å­—å…¸ {etf: {"shares": è‚¡æ•°, "days": æŒ‚å•å¤©æ•°}}
+    C.last_trade_date = ""            # ç”¨äºæ¯æ—¥è®¡æ•°å»é‡
+    C.last_rebalance_date = ""        # ç”¨äºé˜²æ­¢è°ƒä»“é‡å¤è§¦å‘
 
-    # ========== ¹¤³Ì·À»¤ ==========
-    C.order_lock = False              # ·ÀÖØ¸´ÏÂµ¥Ëø
-    C.order_lock_time = None          # ËøÊ±¼ä
-    C.order_book = {}                 # ¶©µ¥²¾
-    C.trade_log = []                  # ³É½»¼ÇÂ¼
+    # ========== å·¥ç¨‹é˜²æŠ¤ ==========
+    C.order_lock = False              # é˜²é‡å¤ä¸‹å•é”
+    C.order_lock_time = None          # é”æ—¶é—´
+    C.order_book = {}                 # è®¢å•ç°¿
+    C.trade_log = []                  # æˆäº¤è®°å½•
 
-    # ========== ½»Ò×ÕË»§ÉèÖÃ ==========
-    C.account = '2064890'             # ?? ÇëÌæ»»ÎªÊµÅÌ/Ä£ÄâÕËºÅ
+    # ========== äº¤æ˜“è´¦æˆ·è®¾ç½® ==========
+    C.account = '2064890'             # è¯·æ›¿æ¢ä¸ºå®ç›˜/æ¨¡æ‹Ÿè´¦å·
     C.acct_type = 'stock'
     C.buy_code = 23
     C.sell_code = 24
 
-    C.set_slippage(0.002)             # Ç§·ÖÖ®¶ş»¬µã
+    C.set_slippage(0.002)             # åƒåˆ†ä¹‹äºŒæ»‘ç‚¹
     C.set_commission(0, [0, 0, 0.00012, 0.00012, 0, 0])
 
-    # ========== ×´Ì¬³Ö¾Ã»¯Ä¿Â¼ ==========
+    # ========== çŠ¶æ€æŒä¹…åŒ–ç›®å½• ==========
     C.state_dir = r"D:\qmt\testdata"
     if not os.path.exists(C.state_dir):
         try:
@@ -76,15 +75,15 @@ def init(C):
         except:
             pass
 
-    # ¼ÓÔØ±¾µØ³Ö¾Ã»¯×´Ì¬
+    # åŠ è½½æœ¬åœ°æŒä¹…åŒ–çŠ¶æ€
     load_state(C)
 
-    print('=== ÎÈ½¡°æETFÂÖ¶¯ v4.6 ×îÖÕÈÚºÏĞŞ¸´°æ ³õÊ¼»¯Íê³É ===')
+    print('=== ç¨³å¥ç‰ˆETFè½®åŠ¨ v4.6 æœ€ç»ˆèåˆä¿®å¤ç‰ˆ åˆå§‹åŒ–å®Œæˆ ===')
 
 
-# ==================== ½»Ò×ÈÕÅĞ¶Ï ====================
+# ==================== äº¤æ˜“æ—¥åˆ¤æ–­ ====================
 def is_trading_time(C):
-    """ÅĞ¶Ïµ±Ç°ÏµÍ³Ê±¼äÊÇ·ñÔÚ½»Ò×Ê±¶ÎÄÚ"""
+    """åˆ¤æ–­å½“å‰ç³»ç»Ÿæ—¶é—´æ˜¯å¦åœ¨äº¤æ˜“æ—¶æ®µå†…"""
     now = datetime.datetime.now()
     if now.weekday() >= 5:
         return False
@@ -95,16 +94,16 @@ def is_trading_time(C):
     return (morning_start <= now <= morning_end) or (afternoon_start <= now <= afternoon_end)
 
 
-# ==================== ×´Ì¬³Ö¾Ã»¯ ====================
+# ==================== çŠ¶æ€æŒä¹…åŒ– ====================
 def load_state(C):
-    """´Ó±¾µØ JSON ÎÄ¼şÖĞ°²È«»Ö¸´×´Ì¬"""
+    """ä»æœ¬åœ° JSON æ–‡ä»¶ä¸­å®‰å…¨æ¢å¤çŠ¶æ€"""
     pattern = os.path.join(C.state_dir, "strategy_state_*.json")
     files = sorted(glob.glob(pattern), reverse=True)
     if not files:
-        print('[³Ö¾Ã»¯] Î´ÕÒµ½ÀúÊ·×´Ì¬ÎÄ¼ş£¬Ê¹ÓÃÄ¬ÈÏ³õÊ¼Öµ')
+        print('[æŒä¹…åŒ–] æœªæ‰¾åˆ°å†å²çŠ¶æ€æ–‡ä»¶ï¼Œä½¿ç”¨é»˜è®¤åˆå§‹å€¼')
         return
     latest_file = files[0]
-    print('[³Ö¾Ã»¯] ´Ó×îĞÂÎÄ¼ş»Ö¸´×´Ì¬:', os.path.basename(latest_file))
+    print('[æŒä¹…åŒ–] ä»æœ€æ–°æ–‡ä»¶æ¢å¤çŠ¶æ€:', os.path.basename(latest_file))
     try:
         with open(latest_file, 'r', encoding='utf-8') as f:
             state = json.load(f)
@@ -119,13 +118,13 @@ def load_state(C):
         C.pending_orders = state.get('pending_orders', {})
         C.order_book = state.get('order_book', {})
         C.trade_log = state.get('trade_log', [])
-        print('[³Ö¾Ã»¯] ×´Ì¬»Ö¸´³É¹¦')
+        print('[æŒä¹…åŒ–] çŠ¶æ€æ¢å¤æˆåŠŸ')
     except Exception as e:
-        print('[³Ö¾Ã»¯] »Ö¸´×´Ì¬Ê§°Ü:', e)
+        print('[æŒä¹…åŒ–] æ¢å¤çŠ¶æ€å¤±è´¥:', e)
 
 
 def save_state(C):
-    # »Ø²âÄ£Ê½ÏÂÊ¼ÖÕÔÊĞí±£´æ£¬Ê¹ÓÃKÏßÈÕÆÚ¶ø·ÇÏµÍ³Ê±¼ä
+    # å›æµ‹æ¨¡å¼ä¸‹å§‹ç»ˆå…è®¸ä¿å­˜ï¼Œä½¿ç”¨Kçº¿æ—¥æœŸè€Œéç³»ç»Ÿæ—¶é—´
     if getattr(C, 'do_back_test', False):
         current_date_str = get_current_date(C).replace('-', '')
     else:
@@ -154,15 +153,15 @@ def save_state(C):
             json.dump(state, f, indent=2)
         os.replace(tmp, filepath)
     except Exception as e:
-        print('[³Ö¾Ã»¯] ±£´æ×´Ì¬Ê§°Ü:', e)
+        print('[æŒä¹…åŒ–] ä¿å­˜çŠ¶æ€å¤±è´¥:', e)
 
 
-# ==================== ĞĞÇéÓëÕË»§º¯Êı ====================
+# ==================== è¡Œæƒ…ä¸è´¦æˆ·å‡½æ•° ====================
 def get_current_date(C):
-    """»ñÈ¡KÏß¶ÔÓ¦µÄÈÕÆÚ×Ö·û´®£¨±±¾©Ê±¼ä£©"""
+    """è·å–Kçº¿å¯¹åº”çš„æ—¥æœŸå­—ç¬¦ä¸²ï¼ˆåŒ—äº¬æ—¶é—´ï¼‰"""
     try:
         ts = C.get_bar_timetag(C.barpos)
-        # ?? ĞŞ¸´£ºÇ¿ÖÆ×ª»»Îª±±¾©Ê±¼ä (UTC+8)£¬±ÜÃâ·şÎñÆ÷Ê±Çø²»Ò»ÖÂ
+        # ä¿®å¤ï¼šå¼ºåˆ¶è½¬æ¢ä¸ºåŒ—äº¬æ—¶é—´ (UTC+8)ï¼Œé¿å…æœåŠ¡å™¨æ—¶åŒºä¸ä¸€è‡´
         dt = datetime.datetime.utcfromtimestamp(ts / 1000) + datetime.timedelta(hours=8)
         return dt.strftime('%Y-%m-%d')
     except:
@@ -170,7 +169,7 @@ def get_current_date(C):
 
 
 def get_current_price(C, stock):
-    """»ñÈ¡±êµÄ×îĞÂÊÕÅÌ¼Û"""
+    """è·å–æ ‡çš„æœ€æ–°æ”¶ç›˜ä»·"""
     try:
         data = C.get_market_data_ex(['close'], [stock], period='1d', count=1)
         if data and stock in data:
@@ -185,11 +184,11 @@ def get_current_price(C, stock):
 
 
 def get_positions(C):
-    """»ñÈ¡µ±Ç°ÕæÊµ³Ö²Ö×Öµä"""
+    """è·å–å½“å‰çœŸå®æŒä»“å­—å…¸"""
     try:
         pos_list = get_trade_detail_data(C.account, C.acct_type, 'position')
     except Exception as e:
-        print('[´íÎó] »ñÈ¡³Ö²ÖÊ§°Ü:', e)
+        print('[é”™è¯¯] è·å–æŒä»“å¤±è´¥:', e)
         return {}
 
     d = {}
@@ -211,7 +210,7 @@ def get_positions(C):
 
 
 def get_available_cash(C):
-    """»ñÈ¡ÕË»§¿ÉÓÃ×Ê½ğ"""
+    """è·å–è´¦æˆ·å¯ç”¨èµ„é‡‘"""
     try:
         acc = get_trade_detail_data(C.account, C.acct_type, 'account')
         if not acc:
@@ -226,7 +225,7 @@ def get_available_cash(C):
 
 
 def get_total_value(C):
-    """»ñÈ¡ÕË»§×Ü×Ê²ú"""
+    """è·å–è´¦æˆ·æ€»èµ„äº§"""
     try:
         acc = get_trade_detail_data(C.account, C.acct_type, 'account')
         if not acc:
@@ -240,9 +239,9 @@ def get_total_value(C):
         return getattr(C, 'last_equity', 0)
 
 
-# ==================== Í³Ò»ÏÂµ¥Èë¿Ú ====================
+# ==================== ç»Ÿä¸€ä¸‹å•å…¥å£ ====================
 def safe_order(C, side, etf, volume, remark):
-    """Ö´ĞĞ½»Ò×Ö¸Áî²¢µÇ¼Çµ½¶©µ¥²¾ÖĞ"""
+    """æ‰§è¡Œäº¤æ˜“æŒ‡ä»¤å¹¶ç™»è®°åˆ°è®¢å•ç°¿ä¸­"""
     try:
         order_id = passorder(
             C.buy_code if side == 'buy' else C.sell_code,
@@ -250,7 +249,7 @@ def safe_order(C, side, etf, volume, remark):
             remark, 2, remark, C
         )
         if order_id:
-            # ¶©µ¥ ID Ç¿ÖÆ×ªÎª str£¬¶Å¾ø JSON ĞòÁĞ»¯¼üÖµÀàĞÍ³åÍ»
+            # è®¢å• ID å¼ºåˆ¶è½¬ä¸º strï¼Œæœç» JSON åºåˆ—åŒ–é”®å€¼ç±»å‹å†²çª
             C.order_book[str(order_id)] = {
                 "etf": etf,
                 "side": side,
@@ -261,18 +260,18 @@ def safe_order(C, side, etf, volume, remark):
             }
         return order_id
     except Exception as e:
-        print("[ÏÂµ¥Ê§°Ü]", e)
+        print("[ä¸‹å•å¤±è´¥]", e)
         return None
 
 
-# ==================== Ñ¡¹É¼ÆËã ====================
+# ==================== é€‰è‚¡è®¡ç®— ====================
 def compute_targets(C, current_date):
-    """¼ÆËãµ±Ç°ÖÜÆÚµÄ×î¼Ñ³Ö²ÖÄ¿±ê"""
+    """è®¡ç®—å½“å‰å‘¨æœŸçš„æœ€ä½³æŒä»“ç›®æ ‡"""
     needed = C.ma_window + max(C.momentum_window_short, C.momentum_window_long) + 2
     data = C.get_market_data_ex(['close'], C.all_etfs, period='1d',
                                 count=needed, end_time=current_date.replace('-', ''))
     if data is None or len(data) == 0:
-        print('[%s] [´íÎó] ÎŞ·¨»ñÈ¡ĞĞÇéÊı¾İ' % current_date)
+        print('[%s] [é”™è¯¯] æ— æ³•è·å–è¡Œæƒ…æ•°æ®' % current_date)
         return [], []
 
     returns = {}
@@ -297,14 +296,14 @@ def compute_targets(C, current_date):
         current_price = close[-1]
         C.last_prices[etf] = current_price
 
-        # Ë«ÖÜÆÚÆ½¾ù¶¯Á¿
+        # åŒå‘¨æœŸå¹³å‡åŠ¨é‡
         ref_short = close[-C.momentum_window_short - 1]
-        ref_long = close[-C.momentum_window_long - 1]
+        ref_long  = close[-C.momentum_window_long - 1]
         mom_short = (current_price / ref_short - 1) if ref_short != 0 else 0
-        mom_long = (current_price / ref_long - 1) if ref_long != 0 else 0
+        mom_long  = (current_price / ref_long - 1) if ref_long != 0 else 0
         momentum = (mom_short + mom_long) / 2.0
 
-        # È¨Òæ±êµÄ ¾ùÏßÔñÊ±¹ıÂË
+        # æƒç›Šæ ‡çš„ å‡çº¿æ‹©æ—¶è¿‡æ»¤
         if etf in C.equity_etfs and current_price < ma:
             returns[etf] = -999
         else:
@@ -314,10 +313,10 @@ def compute_targets(C, current_date):
         return [], []
 
     ser = pd.Series(returns).sort_values(ascending=False)
-    print('[%s] ¶¯Á¿ÆÀ·Ö: %s' % (current_date, ser.head(3).to_dict()))
+    print('[%s] åŠ¨é‡è¯„åˆ†: %s' % (current_date, ser.head(3).to_dict()))
 
     if ser.iloc[0] <= 0:
-        print('[%s] [ÎŞÕıÏò¶¯Á¿] È«Åä±ÜÏÕ¹úÕ®' % current_date)
+        print('[%s] [æ— æ­£å‘åŠ¨é‡] å…¨é…é¿é™©å›½å€º' % current_date)
         return ['511010.SH'], [1.0]
     else:
         target_etfs = ser.head(C.min_holdings).index.tolist()
@@ -326,9 +325,9 @@ def compute_targets(C, current_date):
         return target_etfs, [m / total_mom for m in momentums]
 
 
-# ==================== ½»Ò×Ö÷Ö´ĞĞ ====================
+# ==================== äº¤æ˜“ä¸»æ‰§è¡Œ ====================
 def execute_trades(C, current_date):
-    """Ö´ĞĞµ÷²Ö¶¯×÷²¢¸üĞÂÀíÂÛ¿ÉÓÃ×Ê½ğ"""
+    """æ‰§è¡Œè°ƒä»“åŠ¨ä½œå¹¶æ›´æ–°ç†è®ºå¯ç”¨èµ„é‡‘"""
     now = datetime.datetime.now()
     if C.order_lock and C.order_lock_time:
         if (now - C.order_lock_time).seconds < 5:
@@ -341,11 +340,11 @@ def execute_trades(C, current_date):
         target_set = set(C.target_etfs)
         total_value = get_total_value(C) * C.pos_scale
 
-        print('[%s] ÕıÔÚÖ´ĞĞµ÷²ÖÖ¸ÁîÌá½»...' % current_date)
+        print('[%s] æ­£åœ¨æ‰§è¡Œè°ƒä»“æŒ‡ä»¤æäº¤...' % current_date)
         theoretical_cash = get_available_cash(C)
         traded_today = set()
 
-        # 1. Âô³ö·ÇÄ¿±ê
+        # 1. å–å‡ºéç›®æ ‡
         for etf, pos in list(positions.items()):
             if etf not in target_set:
                 price = get_current_price(C, etf)
@@ -353,12 +352,12 @@ def execute_trades(C, current_date):
                     continue
                 vol = int(pos["shares"] / 100) * 100
                 if vol >= 100:
-                    print('[%s] Âô³ö·ÇÄ¿±ê: %s, %d ¹É' % (current_date, etf, vol))
-                    safe_order(C, 'sell', etf, vol, 'Çå²Ö·ÇÄ¿±ê')
-                    theoretical_cash += (vol * price) * 0.998  # ×Ê½ğ»ØÁı
+                    print('[%s] å–å‡ºéç›®æ ‡: %s, %d è‚¡' % (current_date, etf, vol))
+                    safe_order(C, 'sell', etf, vol, 'æ¸…ä»“éç›®æ ‡')
+                    theoretical_cash += (vol * price) * 0.998  # èµ„é‡‘å›ç¬¼
                     traded_today.add(etf)
 
-        # 2. ÂòÈëĞÂÄ¿±ê
+        # 2. ä¹°å…¥æ–°ç›®æ ‡
         for i, etf in enumerate(C.target_etfs):
             if etf in traded_today:
                 continue
@@ -377,14 +376,14 @@ def execute_trades(C, current_date):
             if abs(delta) < 100:
                 continue
 
-            if delta > 0:  # Ğè²¹×ãÍ·´ç
+            if delta > 0:  # éœ€è¡¥è¶³å¤´å¯¸
                 cost = delta * price * 1.02
                 if cost > theoretical_cash:
-                    # ÏÖ½ğÊÜÏŞ£¬ÏÈ½øĞĞ²¿·ÖÂòÈë
+                    # ç°é‡‘å—é™ï¼Œå…ˆè¿›è¡Œéƒ¨åˆ†ä¹°å…¥
                     max_shares = int(theoretical_cash * 0.98 / price / 100) * 100
                     if max_shares >= 100:
-                        print('[%s] [ÏÖ½ğÊÜÏŞ] %s ÓÅÏÈÂòÈë %d ¹É' % (current_date, etf, max_shares))
-                        safe_order(C, 'buy', etf, max_shares, 'µ÷²Ö²¿·ÖÂòÈë')
+                        print('[%s] [ç°é‡‘å—é™] %s ä¼˜å…ˆä¹°å…¥ %d è‚¡' % (current_date, etf, max_shares))
+                        safe_order(C, 'buy', etf, max_shares, 'è°ƒä»“éƒ¨åˆ†ä¹°å…¥')
                         theoretical_cash -= (max_shares * price * 1.02)
 
                         remaining = delta - max_shares
@@ -393,34 +392,34 @@ def execute_trades(C, current_date):
                                 C.pending_orders[etf]["shares"] += remaining
                             else:
                                 C.pending_orders[etf] = {"shares": remaining, "days": 0}
-                            print('[%s] µÇ¼Ç²¹µ¥: %s È±¶î %d ¹É' % (current_date, etf, remaining))
+                            print('[%s] ç™»è®°è¡¥å•: %s ç¼ºé¢ %d è‚¡' % (current_date, etf, remaining))
                 else:
-                    print('[%s] ÂòÈë½¨²Ö: %s, %d ¹É' % (current_date, etf, delta))
-                    safe_order(C, 'buy', etf, delta, 'µ÷²ÖÂòÈë')
+                    print('[%s] ä¹°å…¥å»ºä»“: %s, %d è‚¡' % (current_date, etf, delta))
+                    safe_order(C, 'buy', etf, delta, 'è°ƒä»“ä¹°å…¥')
                     theoretical_cash -= cost
-            elif delta < 0:  # ²ÖÎ»¶àÓà
-                print('[%s] Âô³ö¼õ²Ö: %s, %d ¹É' % (current_date, etf, abs(delta)))
-                safe_order(C, 'sell', etf, abs(delta), 'µ÷²ÖÂô³ö')
+            elif delta < 0:  # ä»“ä½å¤šä½™
+                print('[%s] å–å‡ºå‡ä»“: %s, %d è‚¡' % (current_date, etf, abs(delta)))
+                safe_order(C, 'sell', etf, abs(delta), 'è°ƒä»“å–å‡º')
 
-        # ½«×îÖÕ×Ê½ğ½á¹ûĞ´»Ø»º´æÖĞ
+        # å°†æœ€ç»ˆèµ„é‡‘ç»“æœå†™å›ç¼“å­˜ä¸­
         C.last_cash = theoretical_cash
 
     finally:
         C.order_lock = False
 
 
-# ==================== ²¹µ¥Ö´ĞĞ ====================
+# ==================== è¡¥å•æ‰§è¡Œ ====================
 def execute_pending_orders(C, current_date):
-    """Ã¿ÈÕ¿ªÅÌ³¢ÊÔ´¦ÀíÒÅÁôÎ´³É½»²¹µ¥"""
+    """æ¯æ—¥å¼€ç›˜å°è¯•å¤„ç†é—ç•™æœªæˆäº¤è¡¥å•"""
     if not C.pending_orders:
         return
 
-    print('[%s] [²¹µ¥] ¼ì²éÎ´³É½»²¹µ¥...' % current_date)
+    print('[%s] [è¡¥å•] æ£€æŸ¥æœªæˆäº¤è¡¥å•...' % current_date)
     available_cash = get_available_cash(C)
     expired = []
 
     for etf, order in list(C.pending_orders.items()):
-        # ÒÆ³ı·ÇÄ¿±ê
+        # ç§»é™¤éç›®æ ‡
         if etf not in getattr(C, 'target_etfs', []):
             expired.append(etf)
             continue
@@ -436,50 +435,50 @@ def execute_pending_orders(C, current_date):
 
         cost = need_shares * price * 1.02
         if available_cash >= cost:
-            print('[%s] [²¹µ¥] Âú×ãÌõ¼ş£¬²¹È«Ê£Óà %s, %d ¹É' % (current_date, etf, need_shares))
-            safe_order(C, 'buy', etf, need_shares, '²¹µ¥Íê³É')
+            print('[%s] [è¡¥å•] æ»¡è¶³æ¡ä»¶ï¼Œè¡¥å…¨å‰©ä½™ %s, %d è‚¡' % (current_date, etf, need_shares))
+            safe_order(C, 'buy', etf, need_shares, 'è¡¥å•å®Œæˆ')
             available_cash -= cost
             expired.append(etf)
         else:
             max_shares = int(available_cash * 0.98 / price / 100) * 100
             if max_shares >= 100:
-                print('[%s] [²¹µ¥] ×Ê½ğ²»×ã£¬ÏÈ²¹ %d ¹É' % (current_date, etf, max_shares))
-                safe_order(C, 'buy', etf, max_shares, '²¹µ¥²¿·Ö')
+                print('[%s] [è¡¥å•] èµ„é‡‘ä¸è¶³ï¼Œå…ˆè¡¥ %d è‚¡' % (current_date, etf, max_shares))
+                safe_order(C, 'buy', etf, max_shares, 'è¡¥å•éƒ¨åˆ†')
                 available_cash -= (max_shares * price * 1.02)
                 order["shares"] -= max_shares
 
                 order["days"] = order.get("days", 0) + 1
                 if order["days"] > 5:
-                    print('[%s] [²¹µ¥] %s ¹Òµ¥³¬Ê±·ÏÆú' % (current_date, etf))
+                    print('[%s] [è¡¥å•] %s æŒ‚å•è¶…æ—¶åºŸå¼ƒ' % (current_date, etf))
                     expired.append(etf)
 
-    # Í³Ò»ÇåÀí¹ıÆÚºÍÒÑÍê³ÉµÄ²¹µ¥
+    # ç»Ÿä¸€æ¸…ç†è¿‡æœŸå’Œå·²å®Œæˆçš„è¡¥å•
     for etf in expired:
         C.pending_orders.pop(etf, None)
 
-    # Í¬²½¸üĞÂ×Ê½ğ»º´æ
+    # åŒæ­¥æ›´æ–°èµ„é‡‘ç¼“å­˜
     C.last_cash = available_cash
     save_state(C)
 
 
-# ==================== ·ç¿ØÖ´ĞĞ ====================
+# ==================== é£æ§æ‰§è¡Œ ====================
 def trigger_lockdown(C, current_date):
-    """´¥·¢ÕË»§È«¾Ö¿Õ²Ö±£»¤"""
+    """è§¦å‘è´¦æˆ·å…¨å±€ç©ºä»“ä¿æŠ¤"""
     positions = get_positions(C)
-    print('[%s] [·ç¿Ø´¥·¢] ÕıÔÚÇå¿Õ³Ö²Ö½øÈë¿Õ²ÖÆÚ' % current_date)
+    print('[%s] [é£æ§è§¦å‘] æ­£åœ¨æ¸…ç©ºæŒä»“è¿›å…¥ç©ºä»“æœŸ' % current_date)
     for etf, pos in positions.items():
         price = get_current_price(C, etf)
         if price > 0:
             vol = int(pos["shares"] / 100) * 100
             if vol >= 100:
-                safe_order(C, 'sell', etf, vol, '¿Õ²Ö±£»¤')
+                safe_order(C, 'sell', etf, vol, 'ç©ºä»“ä¿æŠ¤')
     C.in_lockdown = True
     C.lockdown_days_left = C.lockdown_length
     C.pending_orders = {}
 
 
 def calculate_position_scale(C, current_date):
-    """¸ù¾İ±êµÄÖ¸Êı²¨¶¯ÂÊµ÷½Ú×éºÏ²ÖÎ»"""
+    """æ ¹æ®æ ‡çš„æŒ‡æ•°æ³¢åŠ¨ç‡è°ƒèŠ‚ç»„åˆä»“ä½"""
     data = C.get_market_data_ex(['close'], ['159915.SZ'], period='1d',
                                 count=C.vol_lookback + 5, end_time=current_date.replace('-', ''))
     if data is None or '159915.SZ' not in data:
@@ -500,32 +499,32 @@ def calculate_position_scale(C, current_date):
     vol = np.std(daily_ret) * np.sqrt(252)
     if vol > C.vol_threshold:
         scale = C.vol_threshold / vol
-        print('[%s] [²¨¶¯ÂÊ¸ßÆó] ´´Òµ°åÄê»¯ %.2f%%£¬²ÖÎ»Ñ¹½µÖÁ %.2f' % (current_date, vol * 100, scale))
+        print('[%s] [æ³¢åŠ¨ç‡é«˜ä¼] åˆ›ä¸šæ¿å¹´åŒ– %.2f%%ï¼Œä»“ä½å‹é™è‡³ %.2f' % (current_date, vol * 100, scale))
         return scale
     return 1.0
 
 
-# ==================== Ö÷Èë¿Úº¯Êı ====================
+# ==================== ä¸»å…¥å£å‡½æ•° ====================
 def handlebar(C):
     current_date = get_current_date(C)
     is_backtest = getattr(C, 'do_back_test', False)
 
-    # 1. ×Ê²úÍ»½µÈÛ¶Ï±£»¤
+    # 1. èµ„äº§çªé™ç†”æ–­ä¿æŠ¤
     now_val = get_total_value(C)
     if C.last_equity is not None and now_val > 0:
         if now_val < C.last_equity * 0.85:
-            print('[%s] [ÈÛ¶Ï] µ¥ÈÕ×Ê²ú»Ø³·³¬15%%£¬Í£Ö¹½»Ò×' % current_date)
+            print('[%s] [ç†”æ–­] å•æ—¥èµ„äº§å›æ’¤è¶…15%%ï¼Œåœæ­¢äº¤æ˜“' % current_date)
             return
     C.last_equity = now_val
 
-    # 2. Ã¿ÈÕ¿ªÅÌÊ±¶Î×´Ì¬¸üĞÂÓë²¹µ¥´¦Àí
+    # 2. æ¯æ—¥å¼€ç›˜æ—¶æ®µçŠ¶æ€æ›´æ–°ä¸è¡¥å•å¤„ç†
     if getattr(C, 'last_trade_date', '') != current_date:
         C.last_trade_date = current_date
         C.trade_day_counter += 1
         if not is_backtest and not C.in_lockdown and C.cooling_period_left <= 0:
             execute_pending_orders(C, current_date)
 
-    # 3. µ÷²Ö´¥·¢Ìõ¼ş¹ıÂË
+    # 3. è°ƒä»“è§¦å‘æ¡ä»¶è¿‡æ»¤
     if not is_backtest:
         now = datetime.datetime.now()
         if not (now.hour == 14 and now.minute == 50):
@@ -538,33 +537,33 @@ def handlebar(C):
             return
         C.last_rebalance_date = current_date
 
-    # 4. ¿Õ²ÖËø¶¨ÆÚ¼ì²é
+    # 4. ç©ºä»“é”å®šæœŸæ£€æŸ¥
     if C.in_lockdown:
         C.lockdown_days_left -= 1
         if C.lockdown_days_left <= 0:
             C.in_lockdown = False
             C.watermark = get_total_value(C)
-            print('[%s] [·ç¿Ø] ¿Õ²ÖÆÚ½áÊø' % current_date)
+            print('[%s] [é£æ§] ç©ºä»“æœŸç»“æŸ' % current_date)
         else:
-            print('[%s] [·ç¿Ø] ¿Õ²Ö±£»¤Ê£Óà %d Ìì' % (current_date, C.lockdown_days_left))
+            print('[%s] [é£æ§] ç©ºä»“ä¿æŠ¤å‰©ä½™ %d å¤©' % (current_date, C.lockdown_days_left))
         save_state(C)
         return
 
-    # 5. ¼±µøÀäÈ´ÆÚ¼ì²é£¨?? ĞŞ¸´£ºÌí¼ÓÈÕÖ¾Êä³ö£©
+    # 5. æ€¥è·Œå†·å´æœŸæ£€æŸ¥ï¼ˆä¿®å¤ï¼šæ·»åŠ æ—¥å¿—è¾“å‡ºï¼‰
     if C.cooling_period_left > 0:
         C.cooling_period_left -= 1
-        print('[%s] [·ç¿Ø] ÀäÈ´ÆÚÊ£Óà %d Ìì' % (current_date, C.cooling_period_left))
+        print('[%s] [é£æ§] å†·å´æœŸå‰©ä½™ %d å¤©' % (current_date, C.cooling_period_left))
         save_state(C)
         return
 
-    # 6. ÖÜÆÚµ÷²Ö¹ıÂË
+    # 6. å‘¨æœŸè°ƒä»“è¿‡æ»¤
     if C.trade_day_counter % C.rebalance_freq != 0:
         save_state(C)
         return
 
-    print('[%s] --- ½øÈëÖÜÆÚµ÷²ÖÁ÷³Ì ---' % current_date)
+    print('[%s] --- è¿›å…¥å‘¨æœŸè°ƒä»“æµç¨‹ ---' % current_date)
 
-    # 7. Ë®Ïß¸üĞÂÓëÕûÌå×î´ó»Ø³·Ö¹Ëğ
+    # 7. æ°´çº¿æ›´æ–°ä¸æ•´ä½“æœ€å¤§å›æ’¤æ­¢æŸ
     total_value = get_total_value(C)
     if C.watermark is None or total_value > C.watermark:
         if total_value > 100:
@@ -572,12 +571,12 @@ def handlebar(C):
 
     dd = (total_value - C.watermark) / C.watermark if C.watermark else 0
     if dd < -C.drawdown_limit:
-        print('[%s] [·ç¿Ø] ÕË»§»Ø³· %.2f%% ÆÆÏß£¬Ç¿ÖÆÖ¹Ëğ' % (current_date, dd * 100))
+        print('[%s] [é£æ§] è´¦æˆ·å›æ’¤ %.2f%% ç ´çº¿ï¼Œå¼ºåˆ¶æ­¢æŸ' % (current_date, dd * 100))
         trigger_lockdown(C, current_date)
         save_state(C)
         return
 
-    # 8. ²ÖÎ»¹ÜÀíÓëµ÷²ÖÖ´ĞĞ
+    # 8. ä»“ä½ç®¡ç†ä¸è°ƒä»“æ‰§è¡Œ
     C.pos_scale = calculate_position_scale(C, current_date)
     C.target_etfs, C.target_weights = compute_targets(C, current_date)
 
@@ -585,7 +584,7 @@ def handlebar(C):
         save_state(C)
         return
 
-    C.pending_orders = {}  # µ÷²ÖÈÕÇå¿ÕÉÏÒ»¸öÖÜÆÚµÄ¹Òµ¥»º´æ
+    C.pending_orders = {}  # è°ƒä»“æ—¥æ¸…ç©ºä¸Šä¸€ä¸ªå‘¨æœŸçš„æŒ‚å•ç¼“å­˜
     execute_trades(C, current_date)
     save_state(C)
-    print('[%s] --- ÖÜÆÚµ÷²ÖÒÑÍê³É ---' % current_date)
+    print('[%s] --- å‘¨æœŸè°ƒä»“å·²å®Œæˆ ---' % current_date)
