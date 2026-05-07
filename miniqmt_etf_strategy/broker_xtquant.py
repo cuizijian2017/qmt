@@ -4,7 +4,7 @@ import datetime as dt
 import sys
 import time
 
-from config import ACCOUNT_ID, ACCOUNT_TYPE, ORDER_TIMEOUT_SECONDS, QMT_PATH, STRATEGY_ID, XTQUANT_PATH
+from config import ACCOUNT_ID, ACCOUNT_TYPE, ORDER_TIMEOUT_SECONDS, QMT_PATH, SIMULATION_MODE, STRATEGY_ID, XTQUANT_PATH
 
 sys.path.append(XTQUANT_PATH)
 
@@ -68,12 +68,73 @@ def is_final_status(status):
     return status in ("filled", "canceled", "partial_canceled", "rejected")
 
 
+def _normalize_trade_date_value(value):
+    # 统一把不同形态日期（字符串/时间戳/datetime）归一化为 YYYYMMDD
+    if value is None:
+        return ""
+
+    if isinstance(value, dt.datetime):
+        return value.strftime("%Y%m%d")
+    if isinstance(value, dt.date):
+        return value.strftime("%Y%m%d")
+
+    if isinstance(value, (int, float)):
+        raw = str(int(value))
+        if len(raw) >= 13:
+            return dt.datetime.fromtimestamp(int(raw[:13]) / 1000).strftime("%Y%m%d")
+        if len(raw) == 10:
+            return dt.datetime.fromtimestamp(int(raw)).strftime("%Y%m%d")
+        if len(raw) == 8 and raw.isdigit():
+            return raw
+        return ""
+
+    text = str(value).strip()
+    digits = "".join(ch for ch in text if ch.isdigit())
+    # 兼容 xtdata 把时间戳以字符串/np.int64 形式返回：
+    # 13位毫秒时间戳、10位秒时间戳都需要先转本地日期，不能直接截前8位。
+    if len(digits) >= 13:
+        try:
+            return dt.datetime.fromtimestamp(int(digits[:13]) / 1000).strftime("%Y%m%d")
+        except Exception:
+            pass
+    if len(digits) == 10:
+        try:
+            return dt.datetime.fromtimestamp(int(digits)).strftime("%Y%m%d")
+        except Exception:
+            pass
+    if len(digits) >= 8:
+        return digits[:8]
+    return ""
+
+
 class QmtBroker:
-    def __init__(self, logger, state):
+    def __init__(self, logger, state=None):
         self.logger = logger
-        self.state = state
+        self.state = state or {}
         self.trader = None
         self.account = None
+        self._normalize_order_book_keys()
+
+    def _normalize_order_book_keys(self):
+        # 历史版本可能以 remark 作为 key，这里统一回收为 order_id，避免串单
+        order_book = self.state.get("order_book")
+        if not isinstance(order_book, dict) or not order_book:
+            return
+
+        normalized = {}
+        for old_key, record in order_book.items():
+            if not isinstance(record, dict):
+                continue
+            order_id = str(record.get("order_id", "") or "")
+            key = order_id or str(old_key)
+            existing = normalized.get(key)
+            if existing is None:
+                normalized[key] = dict(record)
+            else:
+                merged = dict(existing)
+                merged.update(record)
+                normalized[key] = merged
+        self.state["order_book"] = normalized
 
     def connect(self):
         session_id = int(time.time())
@@ -143,56 +204,248 @@ class QmtBroker:
         return float(cash) if cash is not None else None
 
     def get_close_history(self, stock_list, count, end_date=None):
+        # 按官方文档规范：先确保数据已下载，再 get_market_data 获取
+        # end_time 指定昨天，取完整的日线（不含当天未收盘的数据）
         try:
-            end_time = (end_date or "").replace("-", "")
+            from datetime import datetime, timedelta
+            yesterday = datetime.now() - timedelta(days=1)
+            end_time = yesterday.strftime("%Y%m%d")
+            if end_date:
+                end_time = end_date.replace("-", "")
+
+            norm_list = [normalize_stock_code(s) for s in stock_list if s]
+            if not norm_list:
+                self.logger.warning("get_close_history: empty stock_list")
+                return {}
+
             data = xtdata.get_market_data(
                 field_list=["close"],
-                stock_list=stock_list,
+                stock_list=norm_list,
                 period="1d",
-                count=count,
                 end_time=end_time,
+                count=count,
+                dividend_type="none",
+                fill_data=True,
             )
-            if isinstance(data, dict) and "close" in data and hasattr(data["close"], "columns"):
-                return {stock: data["close"][stock] for stock in data["close"].columns}
-            if isinstance(data, dict):
-                return data
+            if not isinstance(data, dict) or "close" not in data:
+                self.logger.warning("get_close_history: no close in data, type=%s", type(data).__name__)
+                return {}
+
+            block = data["close"]
+            # 文档约定: K线返回 {field: DataFrame}，index=stock_list, columns=time_list
+            out = {}
+            for s in norm_list:
+                try:
+                    if hasattr(block, "loc"):
+                        if s in block.index:
+                            series = block.loc[s]
+                        elif s in block.columns:
+                            series = block[s]
+                        else:
+                            # 有时 index 可能不带后缀，尝试按代码前缀匹配
+                            prefix = s.split(".")[0]
+                            matched = [idx for idx in block.index if str(idx).startswith(prefix)]
+                            if matched:
+                                series = block.loc[matched[0]]
+                            else:
+                                self.logger.warning("get_close_history: %s not in index or columns", s)
+                                continue
+                    elif isinstance(block, dict) and s in block:
+                        series = block[s]
+                    else:
+                        continue
+
+                    if hasattr(series, "values"):
+                        arr = series.values
+                    elif hasattr(series, "tolist"):
+                        arr = series.tolist()
+                    else:
+                        arr = series
+
+                    import numpy as np
+                    vals = np.asarray(arr, dtype=float).reshape(-1).tolist()
+                    vals = [v for v in vals if not np.isnan(v) and 0 < v < 1e6]
+                    if vals:
+                        out[s] = vals
+                except Exception as exc:
+                    self.logger.warning("get_close_history: skip %s: %s", s, exc)
+                    continue
+
+            if out:
+                return out
+
+            self.logger.warning(
+                "get_close_history: no stocks found, block_type=%s, norm_list=%s, "
+                "block_index=%s, block_cols_head=%s",
+                type(block).__name__, norm_list,
+                list(block.index) if hasattr(block, 'index') else "N/A",
+                list(block.columns)[:5] if hasattr(block, 'columns') else "N/A"
+            )
             return {}
         except Exception as exc:
             self.logger.error("获取历史行情失败: %s", exc)
             return {}
 
-    def get_latest_price(self, stock):
-        history = self.get_close_history([stock], 1)
-        raw = history.get(normalize_stock_code(stock)) or history.get(stock)
-        if raw is None:
-            return 0
-        try:
-            values = raw.values if hasattr(raw, "values") else raw
-            import numpy as np
+    def get_latest_price(self, stock, require_tick=False):
+        """获取最新价格。
+        
+        require_tick=True: 仅用 get_full_tick lastPrice，拿不到返回0（实盘/强制tick场景）
+        require_tick=False: tick→PreClose→日线close 三重回退，保证有值
+        """
+        ns = normalize_stock_code(stock)
 
-            arr = np.asarray(values, dtype=object).reshape(-1)
-            for x in reversed(arr):
-                try:
-                    v = float(x)
+        # 1. 优先 get_full_tick lastPrice
+        try:
+            tick = xtdata.get_full_tick([ns])
+            if isinstance(tick, dict) and ns in tick:
+                t = tick[ns]
+                if isinstance(t, dict):
+                    for key in ("lastPrice", "last_price", "newPrice", "price"):
+                        if key in t and t[key] not in (None, "", 0):
+                            v = float(t[key])
+                            if v > 0:
+                                return v
+        except Exception:
+            pass
+
+        if require_tick:
+            return 0
+
+        # 2. get_instrument_detail PreClose（模拟盘/非交易时段保底）
+        try:
+            detail = xtdata.get_instrument_detail(ns, False)
+            if isinstance(detail, dict):
+                pc = detail.get("PreClose") or detail.get("preClose")
+                if pc not in (None, "", 0):
+                    v = float(pc)
                     if v > 0:
                         return v
-                except Exception:
-                    continue
         except Exception:
+            pass
+
+        # 3. 历史日线 close
+        history = self.get_close_history([stock], 1)
+        raw = history.get(ns) or history.get(stock)
+        if raw is not None:
             try:
-                return float(raw)
+                import numpy as np
+                values = raw.values if hasattr(raw, "values") else raw
+                arr = np.asarray(values, dtype=object).reshape(-1)
+                for x in reversed(arr):
+                    try:
+                        v = float(x)
+                        if v > 0:
+                            return v
+                    except Exception:
+                        continue
             except Exception:
-                return 0
+                try:
+                    return float(raw)
+                except Exception:
+                    pass
         return 0
 
+    def _query_trading_day_by_xtdata(self, target):
+        # 兼容不同 xtdata 版本签名，尽量拿到交易日历结果
+        def _to_date_set(dates):
+            normalized = set()
+            if dates is None:
+                return normalized
+            if isinstance(dates, dict):
+                iterable = dates.values()
+            else:
+                iterable = dates
+            try:
+                for item in iterable:
+                    normalized.add(_normalize_trade_date_value(item))
+            except Exception:
+                pass
+            return {x for x in normalized if x}
+
+        calendar_calls = [
+            ("SH", target, target),
+            ("SH", target, target, 1),
+            ("SZ", target, target),
+            ("SZ", target, target, 1),
+            ("SH", target.replace("-", ""), target.replace("-", "")),
+            ("SZ", target.replace("-", ""), target.replace("-", "")),
+        ]
+        has_response = False
+        collected = set()
+        for args in calendar_calls:
+            try:
+                dates = xtdata.get_trading_dates(*args)
+            except Exception:
+                continue
+            if dates is None:
+                continue
+            has_response = True
+            normalized = _to_date_set(dates)
+            collected.update(normalized)
+            if target in normalized:
+                return True, "xtdata"
+
+        # 某些 xtdata 版本在 start=end=当天 时会返回空列表，补一次"最近N个交易日"查询兜底
+        recent_calendar_calls = [
+            ("SH",),
+            ("SZ",),
+            ("SH", 400),
+            ("SZ", 400),
+            ("SH", "", ""),
+            ("SZ", "", ""),
+            ("SH", "", "", 400),
+            ("SZ", "", "", 400),
+        ]
+        for args in recent_calendar_calls:
+            try:
+                dates = xtdata.get_trading_dates(*args)
+            except Exception:
+                continue
+            if dates is None:
+                continue
+            has_response = True
+            normalized = _to_date_set(dates)
+            collected.update(normalized)
+            if target in normalized:
+                return True, "xtdata_recent"
+
+        if has_response:
+            # 仅在误判风险场景打印少量诊断，帮助快速定位 xtdata 返回格式/签名差异
+            try:
+                sample = sorted(collected)[-5:] if collected else []
+                self.logger.warning("交易日历未命中 target=%s, sample=%s", target, sample)
+            except Exception:
+                pass
+            return False, "xtdata"
+        return None, "xtdata_unavailable"
+
+    def is_trading_day(self, trade_date=None):
+        is_day, _ = self.get_trading_day_status(trade_date)
+        return is_day
+
+    def get_trading_day_status(self, trade_date=None):
+        # 保守策略：交易日历不可用时默认"非交易日"，避免误下单
+        target = _normalize_trade_date_value(trade_date or dt.datetime.now().strftime("%Y-%m-%d"))
+        if not target:
+            return False, "fallback_invalid_date"
+
+        is_day, source = self._query_trading_day_by_xtdata(target)
+        if is_day is not None:
+            return is_day, source
+
+        # Conservative fallback: if calendar API is unavailable, treat as non-trading day.
+        return False, "fallback_conservative"
+
     def sync_orders(self):
+        # 定期同步委托状态，更新 order_book 里的成交与状态字段
         changed = False
         order_book = self.state.setdefault("order_book", {})
 
         for order in self.query_orders():
             order_id = str(getattr(order, "order_id", "") or "")
             remark = str(getattr(order, "order_remark", "") or "")
-            key = remark or order_id
+            # Always prefer broker-assigned order_id as stable key.
+            key = order_id or remark
             if not key:
                 continue
 
@@ -240,11 +493,14 @@ class QmtBroker:
     def add_pending_from_order(self, order_key, order):
         if order.get("side") != "buy":
             return
+        # 只有部分成交的才补单，拒单/撤单（没成交过）不补
+        filled = int(order.get("filled", 0) or 0)
+        if filled <= 0:
+            return
         etf = order.get("etf")
         if etf not in self.state.get("target_etfs", []):
             return
         volume = int(order.get("volume", 0) or 0)
-        filled = int(order.get("filled", 0) or 0)
         remaining = int((volume - filled) / 100) * 100
         if remaining < 100:
             return
@@ -260,9 +516,10 @@ class QmtBroker:
             }
         else:
             pending[etf]["shares"] = int(pending[etf].get("shares", 0)) + remaining
-        self.logger.info("终态买单剩余转补单: key=%s etf=%s remaining=%s", order_key, etf, remaining)
+        self.logger.info("终态买单剩余转补单: key=%s etf=%s filled=%s/%s remaining=%s", order_key, etf, filled, volume, remaining)
 
     def archive_final_orders(self, state=None):
+        # 终态订单打归档标记；买单未成交剩余转入补单池
         changed = False
         state = state or self.state
         for key, order in list(state.get("order_book", {}).items()):
@@ -277,6 +534,7 @@ class QmtBroker:
         return changed
 
     def cancel_stale_orders(self, state=None):
+        # 超时活跃委托自动撤单，降低卡单导致的重复下单风险
         changed = False
         state = state or self.state
         now = dt.datetime.now()
@@ -323,21 +581,51 @@ class QmtBroker:
             return None
 
         order_type = xtconstant.STOCK_BUY if side == "buy" else xtconstant.STOCK_SELL
-        order_id = self.trader.order_stock(
-            self.account,
-            etf,
-            order_type,
-            volume,
-            xtconstant.LATEST_PRICE,
-            0,
-            STRATEGY_ID,
-            remark,
-        )
+
+        if SIMULATION_MODE:
+            # ========== 模拟盘模式：FIX_PRICE + get_latest_price 保底 ==========
+            price = self.get_latest_price(etf)
+            if price <= 0:
+                self.logger.error("[模拟盘] 获取价格失败，跳过下单: side=%s etf=%s", side, etf)
+                return None
+            order_id = self.trader.order_stock(
+                self.account, etf, order_type, volume,
+                xtconstant.FIX_PRICE, price,
+                STRATEGY_ID, remark,
+            )
+            self.logger.info("[模拟盘] 下单: side=%s etf=%s vol=%s price=%s FIX_PRICE", side, etf, volume, price)
+        else:
+            # ========== 实盘模式：文档标准写法 ==========
+            if side == "buy":
+                # 买入：FIX_PRICE + tick lastPrice（官方示例第909行）
+                full_tick = xtdata.get_full_tick([etf])
+                if not isinstance(full_tick, dict) or etf not in full_tick:
+                    self.logger.error("[实盘] get_full_tick 无数据，跳过买入: etf=%s", etf)
+                    return None
+                price = float(full_tick[etf].get("lastPrice", 0))
+                if price <= 0:
+                    self.logger.error("[实盘] lastPrice 无效，跳过买入: etf=%s", etf)
+                    return None
+                order_id = self.trader.order_stock(
+                    self.account, etf, order_type, volume,
+                    xtconstant.FIX_PRICE, price,
+                    STRATEGY_ID, remark,
+                )
+                self.logger.info("[实盘] 买入: etf=%s vol=%s price=%s FIX_PRICE", etf, volume, price)
+            else:
+                # 卖出：LATEST_PRICE + -1（官方示例第922行）
+                order_id = self.trader.order_stock(
+                    self.account, etf, order_type, volume,
+                    xtconstant.LATEST_PRICE, -1,
+                    STRATEGY_ID, remark,
+                )
+                self.logger.info("[实盘] 卖出: etf=%s vol=%s LATEST_PRICE", etf, volume)
+
         if order_id is None or int(order_id) <= 0:
             self.logger.error("下单提交失败: side=%s etf=%s volume=%s remark=%s order_id=%s", side, etf, volume, remark, order_id)
             return None
 
-        key = remark or str(order_id)
+        key = str(order_id)
         self.state.setdefault("order_book", {})[key] = {
             "order_id": str(order_id),
             "remark": remark,
@@ -348,7 +636,7 @@ class QmtBroker:
             "status": "submitted",
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
-        self.logger.info("下单提交: order_id=%s side=%s etf=%s volume=%s remark=%s", order_id, side, etf, volume, remark)
+        self.logger.info("下单提交成功: order_id=%s", order_id)
         return str(order_id)
 
     def cancel_order(self, key, order):
@@ -405,7 +693,7 @@ class QmtBroker:
             def on_stock_order(self, order):
                 remark = str(getattr(order, "order_remark", "") or "")
                 order_id = str(getattr(order, "order_id", "") or "")
-                key = remark or order_id
+                key = order_id or remark
                 if not key:
                     return
                 status = order_status_name(getattr(order, "order_status", None))

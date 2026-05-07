@@ -21,7 +21,6 @@ STRATEGY_NAME = "ETFROT"
 
 STATE_DIR = os.path.join(BASE_DIR, "state")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
-STATE_FILE = os.path.join(STATE_DIR, f"{STRATEGY_ID}_{ACCOUNT_ID}_state.json")
 
 # 主循环和日志
 LOOP_INTERVAL_SECONDS = 30
@@ -74,3 +73,6 @@ ORDER_TIMEOUT_SECONDS = 90
 BUY_SLIPPAGE_BUFFER = 1.02
 SELL_CASH_BUFFER = 0.998
 MIN_TRADE_VALUE = 500
+
+# 运行模式
+SIMULATION_MODE = True  # True=模拟盘(卖出用FIX_PRICE+价格), False=实盘(卖出用LATEST_PRICE+ -1)

@@ -30,17 +30,190 @@ def current_time_hhmm():
     return dt.datetime.now().strftime("%H:%M")
 
 
-def is_rebalance_window():
+def is_trading_session_time():
+    # 仅在连续竞价时段执行“补单/常规落盘”，避免非交易时段误动作
+    now = dt.datetime.now()
+    if now.weekday() >= 5:
+        return False
+    morning_start = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    morning_end = now.replace(hour=11, minute=30, second=0, microsecond=0)
+    afternoon_start = now.replace(hour=13, minute=0, second=0, microsecond=0)
+    afternoon_end = now.replace(hour=15, minute=0, second=0, microsecond=0)
+    return (morning_start <= now <= morning_end) or (afternoon_start <= now <= afternoon_end)
+
+
+def is_trading_day(broker, trade_date=None):
+    if broker is not None:
+        try:
+            return broker.is_trading_day(trade_date)
+        except Exception:
+            pass
+    try:
+        if trade_date:
+            return dt.datetime.strptime(trade_date, "%Y-%m-%d").weekday() < 5
+    except Exception:
+        pass
+    return dt.datetime.now().weekday() < 5
+
+
+def _weekday_fallback_day(trade_date=None):
+    try:
+        if trade_date:
+            return dt.datetime.strptime(trade_date, "%Y-%m-%d").weekday() < 5
+    except Exception:
+        pass
+    return dt.datetime.now().weekday() < 5
+
+
+def get_trading_day_status(broker, trade_date=None):
+    # 交易日统一入口：优先 broker(xtdata) 判定，失败回退到工作日规则
+    if broker is not None:
+        try:
+            return broker.get_trading_day_status(trade_date)
+        except Exception:
+            pass
+    return _weekday_fallback_day(trade_date), "fallback_weekday"
+
+
+def is_state_active_day(broker, trade_date=None):
+    # 状态活跃日用于“状态连续性”，和“是否允许交易”分离处理
+    is_trade_day, source = get_trading_day_status(broker, trade_date)
+    if source == "fallback_conservative":
+        # Calendar API unavailable: avoid trading, but keep state continuity.
+        return _weekday_fallback_day(trade_date)
+    return is_trade_day
+
+
+def is_rebalance_window(broker, trade_date=None):
+    if not is_trading_day(broker, trade_date):
+        return False
     now = current_time_hhmm()
     return REBALANCE_WINDOW_START <= now < REBALANCE_WINDOW_END
 
 
-def update_day_counter(state, trade_date):
+def estimate_future_trading_date(broker, start_date, trading_days_ahead):
+    # 用于日志提示“预计下次调仓/解锁日期”，不参与交易决策
+    if trading_days_ahead <= 0:
+        return start_date
+    try:
+        cursor = dt.datetime.strptime(start_date, "%Y-%m-%d")
+    except Exception:
+        return ""
+
+    passed = 0
+    for _ in range(370):
+        cursor += dt.timedelta(days=1)
+        cursor_str = cursor.strftime("%Y-%m-%d")
+        is_day, source = get_trading_day_status(broker, cursor_str)
+        if source == "fallback_conservative":
+            return ""
+        if is_day:
+            passed += 1
+            if passed >= trading_days_ahead:
+                return cursor_str
+    return ""
+
+
+def update_day_counter(state, broker, trade_date):
+    # 交易日计数是调仓节奏核心，日历不可用时宁可不推进，避免节奏漂移
+    is_trade_day, source = get_trading_day_status(broker, trade_date)
+    if not is_trade_day:
+        return False
+    if source == "fallback_conservative":
+        # Calendar is unavailable; do not advance trade-day counter to avoid cadence drift.
+        return False
     if state.get("last_trade_date") != trade_date:
         state["last_trade_date"] = trade_date
         state["trade_day_counter"] = int(state.get("trade_day_counter", 0)) + 1
         return True
     return False
+
+
+def log_trading_day_status_once_per_day(state, broker, trade_date, logger):
+    # 每日只打一组摘要，便于人工快速巡检
+    if state.get("last_trading_day_log_date") == trade_date:
+        return
+
+    is_trade_day, source = get_trading_day_status(broker, trade_date)
+    state_active_day = is_state_active_day(broker, trade_date)
+
+    state["last_trading_day_log_date"] = trade_date
+    logger.info(
+        "[%s] 今天是否交易日: %s (source=%s, state_day=%s)",
+        trade_date,
+        "是" if is_trade_day else "否",
+        source,
+        "是" if state_active_day else "否",
+    )
+    counter = int(state.get("trade_day_counter", 0))
+    days_to_rebalance = (REBALANCE_FREQ - (counter % REBALANCE_FREQ)) % REBALANCE_FREQ
+    next_rebalance_date = estimate_future_trading_date(broker, trade_date, days_to_rebalance)
+    if next_rebalance_date:
+        logger.info(
+            "[%s] 调仓节奏: trade_day_counter=%s, days_to_rebalance=%s, next_rebalance_date=%s",
+            trade_date,
+            counter,
+            days_to_rebalance,
+            next_rebalance_date,
+        )
+    else:
+        logger.warning(
+            "[%s] 调仓节奏: trade_day_counter=%s, days_to_rebalance=%s, next_rebalance_date=unknown",
+            trade_date,
+            counter,
+            days_to_rebalance,
+        )
+
+    if state.get("in_lockdown"):
+        left = int(state.get("lockdown_days_left", 0))
+        unlock_date = estimate_future_trading_date(broker, trade_date, max(left, 0))
+        if unlock_date:
+            logger.info("[%s] 锁仓状态: lockdown_days_left=%s, estimated_unlock_date=%s", trade_date, left, unlock_date)
+        else:
+            logger.warning("[%s] 锁仓状态: lockdown_days_left=%s, estimated_unlock_date=unknown", trade_date, left)
+
+
+def log_startup_strategy_snapshot(state, broker, trade_date, logger):
+    # 启动快照：开机后第一时间确认策略“接到了哪里”
+    counter = int(state.get("trade_day_counter", 0))
+    days_to_rebalance = (REBALANCE_FREQ - (counter % REBALANCE_FREQ)) % REBALANCE_FREQ
+    next_rebalance_date = estimate_future_trading_date(broker, trade_date, days_to_rebalance)
+    last_rebalance_date = state.get("last_rebalance_date") or "N/A"
+    logger.info(
+        "[启动检查] 上次调仓日期=%s, 当前计数=%s, 距下次调仓剩余交易日=%s, 下次调仓预估日期=%s",
+        last_rebalance_date,
+        counter,
+        days_to_rebalance,
+        next_rebalance_date or "unknown",
+    )
+
+    in_lockdown = bool(state.get("in_lockdown"))
+    lockdown_days_left = int(state.get("lockdown_days_left", 0))
+    pending_count = len(state.get("pending_orders", {}))
+    logger.info(
+        "[启动检查] 锁仓状态=%s, 锁仓剩余天数=%s, 待补单数量=%s",
+        "ON" if in_lockdown else "OFF",
+        lockdown_days_left,
+        pending_count,
+    )
+
+    if in_lockdown:
+        positions = broker.query_positions()
+        if positions is None:
+            logger.warning("[启动检查] 锁仓清仓进度=unknown (持仓查询失败)")
+        else:
+            remain_positions = len(positions)
+            logger.info("[启动检查] 锁仓清仓进度=剩余持仓标的数 %s", remain_positions)
+
+
+def save_state_if_trading_day(state, broker, trade_date, logger, quiet=False):
+    # 常规状态落盘：仅在状态活跃日 + 交易时段执行
+    if not is_state_active_day(broker, trade_date):
+        return False
+    if not is_trading_session_time():
+        return False
+    save_state(state, logger, quiet=quiet, trade_date=trade_date)
+    return True
 
 
 def update_risk_baseline(state, broker, trade_date, logger):
@@ -65,6 +238,7 @@ def update_risk_baseline(state, broker, trade_date, logger):
 
 
 def check_global_risk(state, broker, trade_date, total_asset, logger):
+    # 全局风控：日内回撤与账户级回撤任一触发即进入锁仓
     day_start = state.get("day_start_equity")
     if day_start and total_asset < float(day_start) * (1 - MAX_INTRADAY_DRAWDOWN):
         logger.error("当日资产回撤超过 %.2f%%，进入空仓保护", MAX_INTRADAY_DRAWDOWN * 100)
@@ -82,11 +256,31 @@ def check_global_risk(state, broker, trade_date, total_asset, logger):
     return True
 
 
+def cancel_active_buy_orders_for_lockdown(state, broker, logger):
+    # 锁仓前先撤活跃买单，防止锁仓后买单继续成交
+    canceled = 0
+    for key, order in list(state.get("order_book", {}).items()):
+        if str(order.get("side", "")).lower() != "buy":
+            continue
+        if str(order.get("status", "")).lower() not in ("pending", "submitted", "partial_filled", "canceling", "partial_canceling", "unknown"):
+            continue
+        if order.get("cancel_requested"):
+            continue
+        if broker.cancel_order(key, order):
+            canceled += 1
+    if canceled > 0:
+        logger.warning("锁仓前撤销活跃买单: %s 笔", canceled)
+
+
 def trigger_lockdown(state, broker, trade_date, logger):
     state["in_lockdown"] = True
     state["lockdown_days_left"] = LOCKDOWN_DAYS
     state["pending_orders"] = {}
+    # Prevent pending buy orders from filling after lockdown is triggered.
+    cancel_active_buy_orders_for_lockdown(state, broker, logger)
     submit_lockdown_orders(state, broker, trade_date, logger)
+    # Critical risk state should be persisted immediately.
+    save_state(state, logger, trade_date=trade_date)
 
 
 def submit_lockdown_orders(state, broker, trade_date, logger):
@@ -111,21 +305,27 @@ def submit_lockdown_orders(state, broker, trade_date, logger):
 
 
 def process_lockdown(state, broker, trade_date, logger):
+    # 锁仓计时一天最多处理一次，并在变更后立即落盘
     has_positions = submit_lockdown_orders(state, broker, trade_date, logger)
     if has_positions:
         return True
 
-    if state.get("last_lockdown_check_date") != trade_date:
-        state["last_lockdown_check_date"] = trade_date
-        state["lockdown_days_left"] = int(state.get("lockdown_days_left", 0)) - 1
-        if state["lockdown_days_left"] <= 0:
-            asset = broker.query_asset()
-            total_asset = float(getattr(asset, "total_asset", 0) or 0) if asset else 0
-            state["in_lockdown"] = False
-            state["watermark"] = total_asset or state.get("watermark")
-            logger.info("空仓保护结束")
-        else:
-            logger.info("空仓保护剩余 %s 天", state["lockdown_days_left"])
+    if state.get("last_lockdown_check_date") == trade_date:
+        logger.info("空仓保护计时今日已处理，跳过重复递减")
+        return True
+
+    state["last_lockdown_check_date"] = trade_date
+    state["lockdown_days_left"] = int(state.get("lockdown_days_left", 0)) - 1
+    if state["lockdown_days_left"] <= 0:
+        asset = broker.query_asset()
+        total_asset = float(getattr(asset, "total_asset", 0) or 0) if asset else 0
+        state["in_lockdown"] = False
+        state["watermark"] = total_asset or state.get("watermark")
+        logger.info("空仓保护结束")
+    else:
+        logger.info("空仓保护剩余 %s 天", state["lockdown_days_left"])
+    # Lockdown timer updates are critical and should be persisted immediately.
+    save_state(state, logger, trade_date=trade_date)
     return True
 
 
@@ -136,6 +336,7 @@ def sync_and_archive_orders(state, broker, logger):
 
 
 def execute_pending_orders(state, broker, trade_date, logger):
+    # 补单本身不做日期门禁，由外层 maybe_execute... 控制执行时机
     pending = state.get("pending_orders", {})
     if not pending:
         return
@@ -186,7 +387,20 @@ def execute_pending_orders(state, broker, trade_date, logger):
         pending.pop(stock, None)
 
 
+def maybe_execute_pending_orders_once_per_day(state, broker, trade_date, logger):
+    # 每天最多尝试一次补单，且仅允许在交易日+交易时段触发
+    if state.get("last_pending_process_date") == trade_date:
+        return
+    if not is_trading_day(broker, trade_date):
+        return
+    if not is_trading_session_time():
+        return
+    state["last_pending_process_date"] = trade_date
+    execute_pending_orders(state, broker, trade_date, logger)
+
+
 def set_pending(state, stock, shares, reason, trade_date, order_id=None):
+    # 统一登记待补单，保证股数按 100 股取整并记录追踪字段
     shares = int(shares / 100) * 100
     if shares < 100:
         return
@@ -208,6 +422,7 @@ def set_pending(state, stock, shares, reason, trade_date, order_id=None):
 
 
 def execute_rebalance(state, broker, targets, weights, pos_scale, trade_date, logger):
+    # 调仓原则：先卖后买；买入只使用“实时可用资金”，不预支卖出回款
     asset = broker.query_asset()
     if asset is None:
         logger.error("无法获取资产，调仓中止")
@@ -289,6 +504,7 @@ def execute_rebalance(state, broker, targets, weights, pos_scale, trade_date, lo
 
 
 def process_rebalance_window(state, broker, trade_date, logger):
+    # 窗口内每个交易日只处理一次，避免重复调仓
     if state.get("last_rebalance_date") == trade_date:
         return
     if state.get("last_window_process_date") == trade_date:
@@ -325,20 +541,26 @@ def main():
     logger.info("策略程序启动")
 
     state = load_state(logger)
-    broker = QmtBroker(logger)
+    broker = QmtBroker(logger, state)
     last_heartbeat_time = 0
 
     try:
         broker.connect()
         logger.info("miniQMT 连接成功")
         broker.print_account_snapshot()
-        save_state(state, logger, quiet=False)
+        startup_trade_date = today_str()
+        log_startup_strategy_snapshot(state, broker, startup_trade_date, logger)
+        if save_state_if_trading_day(state, broker, startup_trade_date, logger, quiet=False):
+            logger.info("[%s] 交易时段内，状态文件已写入", startup_trade_date)
+        else:
+            logger.info("[%s] 非交易时段或非交易日，跳过状态文件写入", startup_trade_date)
 
         logger.info("进入主循环")
         while True:
             try:
                 trade_date = today_str()
                 now = time.time()
+                log_trading_day_status_once_per_day(state, broker, trade_date, logger)
 
                 sync_and_archive_orders(state, broker, logger)
 
@@ -348,20 +570,31 @@ def main():
                     continue
 
                 if not check_global_risk(state, broker, trade_date, total_asset, logger):
-                    save_state(state, logger)
+                    # Risk-triggered state changes are critical; persist immediately.
+                    save_state(state, logger, trade_date=trade_date)
                     time.sleep(LOOP_INTERVAL_SECONDS)
                     continue
 
                 if state.get("in_lockdown"):
                     process_lockdown(state, broker, trade_date, logger)
-                    save_state(state, logger)
+                    save_state_if_trading_day(state, broker, trade_date, logger)
                     time.sleep(LOOP_INTERVAL_SECONDS)
                     continue
 
-                if update_day_counter(state, trade_date):
-                    execute_pending_orders(state, broker, trade_date, logger)
+                if update_day_counter(state, broker, trade_date):
+                    logger.info("[%s] 交易日计数递增: trade_day_counter=%s", trade_date, state.get("trade_day_counter", 0))
+                else:
+                    is_trade_day, source = get_trading_day_status(broker, trade_date)
+                    if is_trade_day and source == "fallback_conservative":
+                        logger.warning(
+                            "[%s] 交易日计数被保护性跳过: source=%s。请人工确认交易日历/xtdata状态。",
+                            trade_date,
+                            source,
+                        )
 
-                if is_rebalance_window():
+                maybe_execute_pending_orders_once_per_day(state, broker, trade_date, logger)
+
+                if is_rebalance_window(broker, trade_date):
                     process_rebalance_window(state, broker, trade_date, logger)
 
                 if now - last_heartbeat_time >= HEARTBEAT_INTERVAL_SECONDS:
@@ -369,7 +602,7 @@ def main():
                     broker.print_account_snapshot()
                     last_heartbeat_time = now
 
-                save_state(state, logger)
+                save_state_if_trading_day(state, broker, trade_date, logger)
                 time.sleep(LOOP_INTERVAL_SECONDS)
 
             except KeyboardInterrupt:
@@ -385,7 +618,11 @@ def main():
         logger.error(traceback.format_exc())
     finally:
         try:
-            save_state(state, logger)
+            shutdown_trade_date = today_str()
+            if save_state_if_trading_day(state, broker, shutdown_trade_date, logger):
+                logger.info("[%s] 交易时段内，退出前状态文件已写入", shutdown_trade_date)
+            else:
+                logger.info("[%s] 非交易时段或非交易日，退出前跳过状态文件写入", shutdown_trade_date)
         except Exception:
             logger.error("退出前保存状态失败")
             logger.error(traceback.format_exc())

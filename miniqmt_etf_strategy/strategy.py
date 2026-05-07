@@ -18,6 +18,7 @@ from config import (
 
 
 def extract_close_values(raw):
+    # 兼容 xtdata 各类返回结构，提取一维有效收盘价序列
     if raw is None:
         return []
     try:
@@ -43,6 +44,7 @@ def extract_close_values(raw):
 
 
 def calculate_position_scale(market_data, current_date=None, logger=None):
+    # 基于创业板近期波动率做仓位缩放：波动越高，仓位越低
     if current_date is None:
         current_date = ""
     raw = market_data.get_close_history(["159915.SZ"], VOL_LOOKBACK + 5, current_date).get("159915.SZ")
@@ -62,6 +64,7 @@ def calculate_position_scale(market_data, current_date=None, logger=None):
 
 
 def compute_targets(market_data, current_date=None, state=None, logger=None):
+    # 选股逻辑：动量排序 + 权益均线过滤 + 正动量归一化配权
     if current_date is None:
         current_date = ""
     if state is None:
