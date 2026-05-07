@@ -1,5 +1,5 @@
 #coding:gbk
-# 稳健版 ETF 趋势轮动策略 v5.0 双模式兼容版（回测+模拟盘）
+# 稳健版 ETF 趋势轮动策略 v4.6 标准实盘版（时区修复+日志完善）
 import numpy as np
 import pandas as pd
 import datetime
@@ -41,7 +41,6 @@ def init(C):
     C.vol_lookback = 20               # 波动率计算窗口
     C.vol_threshold = 0.34            # 波动率阈值
     C.pos_scale = 1.0                 # 仓位缩放系数
-    C.equity_scale_for_sizing = 1.0   # 资产放大系数（避免回测资金不够）
 
     C.last_equity = None              # 上次总资产（用于资产异常熔断）
     C.last_cash = None                # 上次可用资金（用于缓存恢复）
@@ -59,22 +58,13 @@ def init(C):
     C.last_lockdown_check_date = ""     # 空仓保护计时日期
     C.rebalance_window_minutes = 6      # 14:50 后允许触发的分钟窗口
 
-    # ========== 模拟盘特有配置 ==========
-    C.sim_rebalance_hour = 14         # 模拟盘调仓小时
-    C.sim_rebalance_minute = 50       # 模拟盘调仓分钟
-    C.sim_rebalance_window = 30       # 模拟盘调仓窗口（分钟）
-    C.max_passorder_shares = 100000   # 单次最大下单股数
-    C._is_historical_playback = False # 是否处于历史回放（避免模拟盘误交易旧数据）
-
-    # ========== 回测特有配置 ==========
-    C.log_backtest_orders = False      # 回测下单日志默认关闭，避免刷屏
-
     # ========== 工程防护 ==========
     C.order_lock = False              # 防重复下单锁
     C.order_lock_time = None          # 锁时间
     C.order_book = {}                 # 订单簿
     C.trade_log = []                  # 成交记录
     C.order_timeout_seconds = 90      # 普通委托超时撤单阈值
+    C.log_backtest_orders = False      # 回测下单日志默认关闭，避免刷屏
 
     # ========== 交易账户设置 ==========
     C.account = '2064890'             # 请替换为实盘/模拟账号
@@ -86,7 +76,7 @@ def init(C):
     C.set_commission(0, [0, 0, 0.00012, 0.00012, 0, 0])
 
     # ========== 状态持久化目录 ==========
-    C.state_dir = r"D:\qmt\monidata"
+    C.state_dir = r"D:\qmt\testdata"
     if not os.path.exists(C.state_dir):
         try:
             os.makedirs(C.state_dir)
@@ -94,37 +84,12 @@ def init(C):
             pass
 
     # 回测使用内存状态，避免读取/覆盖实盘持久化文件
-    is_backtest = getattr(C, 'do_back_test', False)
-    if is_backtest:
+    if getattr(C, 'do_back_test', False):
         print('[持久化] 回测模式跳过本地状态加载')
     else:
         load_state(C)
 
-    # ========== 初始化日志输出 ==========
-    print('=== 稳健版ETF轮动 v5.0 双模式兼容版 初始化完成 ===')
-    print('[参数] ---------- 运行模式 ----------')
-    print('[参数] %s' % ('回测' if is_backtest else '模拟/实盘'))
-    print('[参数] ---------- 标的与周期 ----------')
-    print('[参数] 权益池: %s' % ', '.join(C.equity_etfs))
-    print('[参数] 避险池: %s' % ', '.join(C.defense_etfs))
-    print('[参数] 调仓频率: %d 交易日 | 最少持有: %d' % (C.rebalance_freq, C.min_holdings))
-    print('[参数] 动量窗口: 短=%d, 长=%d | 均线过滤: %d' % (
-        C.momentum_window_short, C.momentum_window_long, C.ma_window
-    ))
-    print('[参数] ---------- 风控与仓位 ----------')
-    print('[参数] 回撤止损: %.0f%% | 空仓保护: %d 天 | 急跌冷却: %d 天' % (
-        C.drawdown_limit*100, C.lockdown_length, C.cooling_length
-    ))
-    print('[参数] 波动率阈值: %.2f | 仓位缩放: %.2f' % (C.vol_threshold, C.pos_scale))
-    print('[参数] 仓位计算资产放大: %.2f' % C.equity_scale_for_sizing)
-    if not is_backtest:
-        print('[参数] ---------- 模拟盘调仓时间 ----------')
-        print('[参数] 调仓时间: %02d:%02d ±%d 分钟' % (
-            C.sim_rebalance_hour, C.sim_rebalance_minute, C.sim_rebalance_window
-        ))
-        print('[参数] 单次最大下单: %d 股' % C.max_passorder_shares)
-        print('[参数] 状态目录: %s' % C.state_dir)
-    print('[参数] ---------- 初始化结束 ----------')
+    print('=== 稳健版ETF轮动 v4.6 最终融合修复版 初始化完成 ===')
 
 
 # ==================== 交易日判断 ====================
@@ -305,58 +270,11 @@ def get_latest_valid_price(raw):
 
 def in_rebalance_window(C):
     """实盘使用 14:50 后的短窗口触发，避免精确分钟错过调仓。"""
-    is_backtest = getattr(C, 'do_back_test', False)
-    if is_backtest:
-        # 回测直接返回 True，由 handlebar 控制
-        return True
     now = datetime.datetime.now()
-    start = now.replace(hour=C.sim_rebalance_hour, minute=C.sim_rebalance_minute, second=0, microsecond=0)
-    end = start + datetime.timedelta(minutes=C.sim_rebalance_window)
+    start = now.replace(hour=14, minute=50, second=0, microsecond=0)
+    minutes = getattr(C, 'rebalance_window_minutes', 6)
+    end = start + datetime.timedelta(minutes=minutes)
     return start <= now < end
-
-
-def log_rebalance_allocation(C, current_date, positions):
-    """输出详细的调仓日志，用于验证策略逻辑"""
-    is_backtest = getattr(C, 'do_back_test', False)
-    if is_backtest:
-        # 回测不输出，避免刷屏
-        return
-    print('[%s] ========== 调仓目标详情 ==========' % current_date)
-    total_value = get_total_value(C)
-    if total_value is None:
-        print('[%s] [无法获取总资产，跳过详情日志]' % current_date)
-        return
-    total_value *= C.pos_scale
-
-    print('[%s] 总资产: %.2f (仓位缩放: %.2f)' % (current_date, total_value, C.pos_scale))
-    print('[%s] 目标ETF: %s' % (current_date, ', '.join(C.target_etfs)))
-    print('[%s] 目标权重: %s' % (current_date, ', '.join(['%.2f%%' % (w*100) for w in C.target_weights])))
-    print('[%s]' % current_date)
-    print('[%s] %-12s %12s %12s %12s %12s %12s' % (
-        current_date, 'ETF', '目标权重', '目标市值', '当前市值', '当前持股', '目标持股'
-    ))
-    print('[%s] %s' % (current_date, '-'*90))
-
-    for i, etf in enumerate(C.target_etfs):
-        target_weight = C.target_weights[i]
-        target_value = total_value * target_weight
-        price = C.last_prices.get(etf, 0)
-        if price <= 0:
-            price = get_current_price(C, etf)
-        target_shares = int(target_value / price / 100) * 100 if price > 0 else 0
-        current_pos = positions.get(etf, {})
-        current_value = current_pos.get('value', 0)
-        current_shares = current_pos.get('shares', 0)
-        print('[%s] %-12s %11.2f%% %12.2f %12.2f %12d %12d' % (
-            current_date,
-            etf,
-            target_weight*100,
-            target_value,
-            current_value,
-            current_shares,
-            target_shares
-        ))
-    print('[%s] ========== 目标详情结束 ==========' % current_date)
 
 
 def get_current_price(C, stock):
@@ -1012,140 +930,16 @@ def handlebar(C):
     current_date = get_current_date(C)
     is_backtest = getattr(C, 'do_back_test', False)
 
-    # ========================================
-    # 完全独立的回测逻辑（完全沿用 huice.py）
-    # ========================================
-    if is_backtest:
-        handlebar_backtest(C, current_date)
-        return
+    if not is_backtest:
+        cancel_stale_orders(C, current_date)
 
-    # ========================================
-    # 模拟盘/实盘逻辑（带增强功能）
-    # ========================================
-    handlebar_simulation(C, current_date)
-
-
-def handlebar_backtest(C, current_date):
-    """
-    回测专用逻辑（完全复制 huice.py，确保回测结果一致）
-    """
-    # 1. 账户数据检查
-    now_val = get_total_value(C)
-    if now_val is None:
-        return
-
-    # 2. 每日资产熔断和回撤检查
-    if getattr(C, 'risk_check_date', '') != current_date:
-        C.risk_check_date = current_date
-        C.day_start_equity = now_val if now_val > 0 else None
-    elif getattr(C, 'day_start_equity', None) is None and now_val > 0:
-        C.day_start_equity = now_val
-
-    day_start_equity = getattr(C, 'day_start_equity', None)
-    if day_start_equity and now_val > 0:
-        if now_val < day_start_equity * 0.85:
-            save_state(C)
-            return
-
-    if now_val > 100:
-        if C.watermark is None or now_val > C.watermark:
-            C.watermark = now_val
-        dd = (now_val - C.watermark) / C.watermark if C.watermark else 0
-        if dd < -C.drawdown_limit and not C.in_lockdown:
-            trigger_lockdown(C, current_date)
-            save_state(C)
-            return
-
-    # 3. 空仓锁定期处理
-    if C.in_lockdown:
-        has_positions = submit_lockdown_liquidation(C, current_date)
-        if has_positions:
-            save_state(C)
-            return
-
-        if getattr(C, 'last_lockdown_check_date', '') != current_date:
-            C.last_lockdown_check_date = current_date
-            C.lockdown_days_left -= 1
-            if C.lockdown_days_left <= 0:
-                C.in_lockdown = False
-                C.watermark = now_val
-        save_state(C)
-        return
-
-    # 4. 每日开盘更新
-    if getattr(C, 'last_trade_date', '') != current_date:
-        C.last_trade_date = current_date
-        C.trade_day_counter += 1
-        save_state(C)
-
-    # 5. 调仓触发（回测每日只执行一次）
-    if getattr(C, 'last_rebalance_date', '') == current_date:
-        return
-
-    # 6. 冷却期检查
-    if C.cooling_period_left > 0:
-        C.cooling_period_left -= 1
-        C.last_window_process_date = current_date
-        save_state(C)
-        return
-
-    # 7. 周期调仓过滤
-    if C.trade_day_counter % C.rebalance_freq != 0:
-        C.last_window_process_date = current_date
-        save_state(C)
-        return
-
-    # 8. 执行调仓
-    C.pos_scale = calculate_position_scale(C, current_date)
-    C.target_etfs, C.target_weights = compute_targets(C, current_date)
-
-    if not C.target_etfs:
-        save_state(C)
-        return
-
-    C.pending_orders = {}
-    trade_ok = execute_trades(C, current_date)
-    if trade_ok:
-        C.last_rebalance_date = current_date
-        C.last_window_process_date = current_date
-    save_state(C)
-
-
-def handlebar_simulation(C, current_date):
-    """
-    模拟盘/实盘专用逻辑（带历史回放保护、详细日志等增强功能）
-    """
-    # 1. 历史回放保护（避免模拟盘误交易旧数据）
-    try:
-        dt_current = datetime.datetime.strptime(current_date, '%Y-%m-%d')
-        dt_now = datetime.datetime.now()
-        days_diff = abs((dt_now - dt_current).days)
-        if days_diff > 3:
-            if not C._is_historical_playback:
-                print('[%s] [模拟盘历史回放] 当前日期 %s 与系统日期差距 %d 天，跳过交易' % (
-                    current_date, current_date, days_diff
-                ))
-                C._is_historical_playback = True
-            if getattr(C, 'last_trade_date', '') != current_date:
-                C.last_trade_date = current_date
-                C.trade_day_counter += 1
-                save_state(C)
-            return
-        else:
-            C._is_historical_playback = False
-    except Exception:
-        pass
-
-    # 2. 先撤掉超时订单
-    cancel_stale_orders(C, current_date)
-
-    # 3. 账户数据异常时直接停止
+    # 1. 账户数据异常时直接停止，避免使用旧缓存继续交易。
     now_val = get_total_value(C)
     if now_val is None:
         print('[%s] [账户异常] 无法获取账户总资产，停止本轮处理' % current_date)
         return
 
-    # 4. 每日资产熔断和回撤检查
+    # 2. 每日资产熔断和账户最大回撤检查，每个交易日都执行。
     if getattr(C, 'risk_check_date', '') != current_date:
         C.risk_check_date = current_date
         C.day_start_equity = now_val if now_val > 0 else None
@@ -1169,7 +963,7 @@ def handlebar_simulation(C, current_date):
             save_state(C)
             return
 
-    # 5. 空仓锁定期处理
+    # 3. 空仓锁定期优先处理：每日确认真实持仓是否已经清空。
     if C.in_lockdown:
         has_positions = submit_lockdown_liquidation(C, current_date)
         if has_positions:
@@ -1188,23 +982,27 @@ def handlebar_simulation(C, current_date):
         save_state(C)
         return
 
-    # 6. 每日开盘补单处理
+    # 4. 每日开盘时段状态更新与补单处理，重启后依赖持久化日期防止重复计数。
     if getattr(C, 'last_trade_date', '') != current_date:
         C.last_trade_date = current_date
         C.trade_day_counter += 1
-        if C.cooling_period_left <= 0:
+        if not is_backtest and C.cooling_period_left <= 0:
             execute_pending_orders(C, current_date)
         save_state(C)
 
-    # 7. 调仓时间窗口检查
-    if not in_rebalance_window(C):
-        return
-    if getattr(C, 'last_rebalance_date', '') == current_date:
-        return
-    if getattr(C, 'last_window_process_date', '') == current_date:
-        return
+    # 5. 调仓触发条件过滤：实盘使用 14:50 后短窗口。
+    if not is_backtest:
+        if not in_rebalance_window(C):
+            return
+        if getattr(C, 'last_rebalance_date', '') == current_date:
+            return
+        if getattr(C, 'last_window_process_date', '') == current_date:
+            return
+    else:
+        if getattr(C, 'last_rebalance_date', '') == current_date:
+            return
 
-    # 8. 冷却期检查
+    # 6. 急跌冷却期检查（修复：添加日志输出）
     if C.cooling_period_left > 0:
         C.cooling_period_left -= 1
         C.last_window_process_date = current_date
@@ -1212,7 +1010,7 @@ def handlebar_simulation(C, current_date):
         save_state(C)
         return
 
-    # 9. 周期调仓过滤
+    # 7. 周期调仓过滤
     if C.trade_day_counter % C.rebalance_freq != 0:
         C.last_window_process_date = current_date
         save_state(C)
@@ -1220,7 +1018,7 @@ def handlebar_simulation(C, current_date):
 
     print('[%s] --- 进入周期调仓流程 ---' % current_date)
 
-    # 10. 计算调仓目标
+    # 8. 仓位管理与调仓执行
     C.pos_scale = calculate_position_scale(C, current_date)
     C.target_etfs, C.target_weights = compute_targets(C, current_date)
 
@@ -1228,12 +1026,7 @@ def handlebar_simulation(C, current_date):
         save_state(C)
         return
 
-    # 11. 输出调仓详情日志
-    positions = get_positions(C)
-    log_rebalance_allocation(C, current_date, positions if positions is not None else {})
-
-    # 12. 执行调仓
-    C.pending_orders = {}
+    C.pending_orders = {}  # 调仓日清空上一个周期的挂单缓存
     trade_ok = execute_trades(C, current_date)
     if trade_ok:
         C.last_rebalance_date = current_date
