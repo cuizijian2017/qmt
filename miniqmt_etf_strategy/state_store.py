@@ -23,7 +23,7 @@ def default_state():
         "lockdown_days_left": 0,
         "last_lockdown_order_date": "",
         "last_lockdown_check_date": "",
-        "cooling_period_left": 0,
+
         "trade_day_counter": 0,
         "last_trade_date": "",
         "last_rebalance_date": "",

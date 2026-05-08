@@ -203,9 +203,66 @@ class QmtBroker:
             cash = getattr(asset, "m_dCash", None)
         return float(cash) if cash is not None else None
 
+    def _download_history(self, stock_list, period="1d"):
+        """按官方文档规范：下载历史数据到本地缓存（增量模式，已有数据不重复拉）。"""
+        for s in stock_list:
+            bare = s.split(".")[0] if "." in s else s
+            dl2 = getattr(xtdata, "download_history_data2", None)
+            if dl2:
+                try:
+                    dl2([bare], period, "", "")
+                except TypeError:
+                    try:
+                        dl2(stock_list=[bare], period=period)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            dl = getattr(xtdata, "download_history_data", None)
+            if dl:
+                try:
+                    dl(bare, period=period, incrementally=True)
+                except TypeError:
+                    try:
+                        dl(bare, period, incrementally=True)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+    def prepare_data(self, stock_list):
+        """启动时一次性完成：下载历史 + 订阅行情。之后 get_close_history / get_latest_price 直接取。"""
+        self._download_history(stock_list, "1d")
+
+        sub = getattr(xtdata, "subscribe_quote", None)
+        if sub:
+            for s in stock_list:
+                bare = s.split(".")[0] if "." in s else s
+                try:
+                    sub(bare, period="1d", count=-1, dividend_type="none")
+                except TypeError:
+                    try:
+                        sub(bare, period="1d", count=-1)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                try:
+                    sub(bare, period="tick", count=-1)
+                except TypeError:
+                    try:
+                        sub(stock_list=[bare], period="tick", count=-1)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+        self.logger.info("数据准备完成: 已下载历史并订阅 %d 只 ETF", len(stock_list))
+
+    def download_daily(self, stock_list):
+        """每日收盘后调用一次，增量更新当日数据。"""
+        self._download_history(stock_list, "1d")
+
     def get_close_history(self, stock_list, count, end_date=None):
-        # 按官方文档规范：先确保数据已下载，再 get_market_data 获取
-        # end_time 指定昨天，取完整的日线（不含当天未收盘的数据）
         try:
             from datetime import datetime, timedelta
             yesterday = datetime.now() - timedelta(days=1)
@@ -451,6 +508,9 @@ class QmtBroker:
 
             status = order_status_name(getattr(order, "order_status", None))
             record = order_book.setdefault(key, {})
+            # 新发现的订单（不是 submit_order 创建的）补上 created_at
+            if "created_at" not in record:
+                record["created_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
             before = dict(record)
             record.update(
                 {
@@ -490,7 +550,7 @@ class QmtBroker:
                 return key, order
         return None, None
 
-    def add_pending_from_order(self, order_key, order):
+    def add_pending_from_order(self, order_key, order, trade_date=None):
         if order.get("side") != "buy":
             return
         # 只有部分成交的才补单，拒单/撤单（没成交过）不补
@@ -504,13 +564,15 @@ class QmtBroker:
         remaining = int((volume - filled) / 100) * 100
         if remaining < 100:
             return
+        if trade_date is None:
+            trade_date = dt.datetime.now().strftime("%Y-%m-%d")
         pending = self.state.setdefault("pending_orders", {})
         if etf not in pending:
             pending[etf] = {
                 "shares": remaining,
                 "days": 0,
                 "reason": "order_" + str(order.get("status")),
-                "source_rebalance_date": dt.datetime.now().strftime("%Y-%m-%d"),
+                "source_rebalance_date": trade_date,
                 "last_order_id": str(order.get("order_id") or ""),
                 "attempt_count": 0,
             }
@@ -518,7 +580,7 @@ class QmtBroker:
             pending[etf]["shares"] = int(pending[etf].get("shares", 0)) + remaining
         self.logger.info("终态买单剩余转补单: key=%s etf=%s filled=%s/%s remaining=%s", order_key, etf, filled, volume, remaining)
 
-    def archive_final_orders(self, state=None):
+    def archive_final_orders(self, state=None, trade_date=None):
         # 终态订单打归档标记；买单未成交剩余转入补单池
         changed = False
         state = state or self.state
@@ -529,7 +591,7 @@ class QmtBroker:
                 continue
             order["archived"] = True
             order["archive_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            self.add_pending_from_order(key, order)
+            self.add_pending_from_order(key, order, trade_date)
             changed = True
         return changed
 
@@ -626,16 +688,16 @@ class QmtBroker:
             return None
 
         key = str(order_id)
-        self.state.setdefault("order_book", {})[key] = {
-            "order_id": str(order_id),
-            "remark": remark,
-            "etf": etf,
-            "side": side,
-            "volume": volume,
-            "filled": 0,
-            "status": "submitted",
-            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        }
+        # 用 setdefault 只补基础字段，防止覆盖回调 on_stock_order 已写入的成交状态
+        record = self.state.setdefault("order_book", {}).setdefault(key, {})
+        record.setdefault("order_id", str(order_id))
+        record.setdefault("remark", remark)
+        record.setdefault("etf", etf)
+        record.setdefault("side", side)
+        record.setdefault("volume", volume)
+        record.setdefault("filled", 0)
+        record.setdefault("status", "submitted")
+        record.setdefault("created_at", time.strftime("%Y-%m-%d %H:%M:%S"))
         self.logger.info("下单提交成功: order_id=%s", order_id)
         return str(order_id)
 

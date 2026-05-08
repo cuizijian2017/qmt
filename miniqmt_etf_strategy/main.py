@@ -6,7 +6,8 @@ import traceback
 
 from broker_xtquant import QmtBroker
 from config import (
-    COOLING_PERIOD_DAYS,
+    ALL_ETFS,
+    CAPITAL_RATIO,
     DRAWDOWN_LIMIT,
     HEARTBEAT_INTERVAL_SECONDS,
     LOCKDOWN_DAYS,
@@ -238,11 +239,11 @@ def update_risk_baseline(state, broker, trade_date, logger):
 
 
 def check_global_risk(state, broker, trade_date, total_asset, logger):
-    # 全局风控：日内回撤与账户级回撤任一触发即进入锁仓
+    # 全局风控：日内回撤暂停当日交易，账户级回撤进入锁仓
     day_start = state.get("day_start_equity")
     if day_start and total_asset < float(day_start) * (1 - MAX_INTRADAY_DRAWDOWN):
-        logger.error("当日资产回撤超过 %.2f%%，进入空仓保护", MAX_INTRADAY_DRAWDOWN * 100)
-        trigger_lockdown(state, broker, trade_date, logger)
+        logger.error("当日资产回撤超过 %.2f%%，暂停当日交易", MAX_INTRADAY_DRAWDOWN * 100)
+        # 不触发锁仓，仅跳过本轮操作，次日 day_start_equity 重置后自动恢复
         return False
 
     watermark = state.get("watermark")
@@ -329,9 +330,9 @@ def process_lockdown(state, broker, trade_date, logger):
     return True
 
 
-def sync_and_archive_orders(state, broker, logger):
+def sync_and_archive_orders(state, broker, trade_date, logger):
     broker.sync_orders()
-    broker.archive_final_orders()
+    broker.archive_final_orders(trade_date=trade_date)
     broker.cancel_stale_orders()
 
 
@@ -421,119 +422,179 @@ def set_pending(state, stock, shares, reason, trade_date, order_id=None):
             pending[stock]["last_order_id"] = str(order_id)
 
 
-def execute_rebalance(state, broker, targets, weights, pos_scale, trade_date, logger):
-    # 调仓原则：先卖后买；买入只使用“实时可用资金”，不预支卖出回款
+def execute_sells(state, broker, targets, weights, pos_scale, trade_date, logger):
+    """阶段一：只提交卖单。"""
     asset = broker.query_asset()
     if asset is None:
-        logger.error("无法获取资产，调仓中止")
+        logger.error("无法获取资产，卖单中止")
         return False
 
     total_asset = float(getattr(asset, "total_asset", 0) or getattr(asset, "m_dTotalAsset", 0) or 0)
-    cash = float(getattr(asset, "cash", 0) or getattr(asset, "m_dCash", 0) or 0)
     if total_asset <= 0:
-        logger.error("账户资产无效，调仓中止")
+        logger.error("账户资产无效，卖单中止")
         return False
 
     positions = broker.positions_dict()
+    scaled_asset = total_asset * pos_scale * CAPITAL_RATIO
     target_set = set(targets)
-    scaled_asset = total_asset * pos_scale
+    submitted = 0
 
-    logger.info("目标持仓: %s", dict(zip(targets, weights)))
-    logger.info("仓位缩放: %.4f, 总资产: %.2f, 可用资金: %.2f", pos_scale, total_asset, cash)
-
+    logger.info("========== 阶段一：卖出计划 ==========")
     for stock, pos in list(positions.items()):
         shares = int(pos.get("shares", 0) / 100) * 100
         if shares < 100:
             continue
+        price = broker.get_latest_price(stock)
+
         if stock not in target_set:
+            logger.info("【卖出】%s 清仓 %d 股（非目标） 现价≈%.2f 市值≈%.2f",
+                        stock, shares, price, price * shares if price > 0 else 0)
             if not broker.has_active_order(stock, "sell")[0]:
                 broker.order("sell", stock, shares, "清仓非目标")
+                submitted += 1
             continue
 
         idx = targets.index(stock)
-        price = broker.get_latest_price(stock)
         if price <= 0:
             continue
         target_value = scaled_asset * weights[idx]
         target_shares = int(target_value / price / 100) * 100
         delta = target_shares - shares
-        if delta <= -100 and not broker.has_active_order(stock, "sell")[0]:
-            broker.order("sell", stock, abs(delta), "调仓卖出")
+        if delta <= -100:
+            logger.info("【卖出】%s 减仓 %d 股（超配 %d→%d） 现价≈%.2f",
+                        stock, abs(delta), shares, target_shares, price)
+            if not broker.has_active_order(stock, "sell")[0]:
+                broker.order("sell", stock, abs(delta), "调仓卖出")
+                submitted += 1
 
-    sync_and_archive_orders(state, broker, logger)
+    sync_and_archive_orders(state, broker, trade_date, logger)
+    logger.info("阶段一完成：已提交 %d 笔卖单，等待成交", submitted)
+    return True
+
+
+def execute_buys(state, broker, targets, weights, pos_scale, trade_date, logger):
+    """阶段二：卖单成交后，用可用资金买入目标。"""
+    sync_and_archive_orders(state, broker, trade_date, logger)
+    positions = broker.positions_dict()
+
     asset = broker.query_asset()
-    cash = float(getattr(asset, "cash", 0) or getattr(asset, "m_dCash", 0) or 0) if asset else 0
+    if asset is None:
+        return False
+    total_asset = float(getattr(asset, "total_asset", 0) or getattr(asset, "m_dTotalAsset", 0) or 0)
+    cash = float(getattr(asset, "cash", 0) or getattr(asset, "m_dCash", 0) or 0)
+    scaled_asset = total_asset * pos_scale * CAPITAL_RATIO
+
+    logger.info("========== 阶段二：买入计划 ==========")
+    logger.info("可用资金: %.2f  目标仓位: %s", cash, dict(zip(targets, weights)))
 
     for stock, weight in zip(targets, weights):
         if broker.has_active_order(stock, "buy")[0]:
+            logger.info("【跳过】%s 已有活跃买单", stock)
             continue
-
         price = broker.get_latest_price(stock)
         if price <= 0:
+            logger.warning("【跳过】%s 无法获取价格", stock)
             continue
-
         current_shares = int(positions.get(stock, {}).get("shares", 0))
         target_value = scaled_asset * weight
         if target_value < MIN_TRADE_VALUE:
             continue
-
         target_shares = int(target_value / price / 100) * 100
         delta = target_shares - current_shares
         if delta < 100:
+            logger.info("【持有】%s 当前 %d 股 目标 %d 股 无需调整", stock, current_shares, target_shares)
             continue
-
         max_affordable = int(cash * 0.98 / price / 100) * 100
         buy_shares = min(delta, max_affordable)
-        submitted = 0
+        submitted_buy = 0
         if buy_shares >= 100:
-            order_id = broker.order("buy", stock, buy_shares, "调仓买入" if buy_shares == delta else "调仓部分买入")
+            remark = "调仓买入" if buy_shares == delta else "调仓部分买入"
+            logger.info("【买入】%s %d 股（需%d 可买%d） 现价≈%.2f 金额≈%.2f %s",
+                        stock, buy_shares, delta, max_affordable, price,
+                        buy_shares * price * 1.02, remark)
+            order_id = broker.order("buy", stock, buy_shares, remark)
             if order_id:
-                submitted = buy_shares
+                submitted_buy = buy_shares
                 cash -= buy_shares * price * 1.02
-
-        remaining = delta - submitted
+            else:
+                logger.error("【失败】%s 下单失败，需手动买入 %d 股", stock, buy_shares)
+        else:
+            logger.warning("【资金不足】%s 需买 %d 股 但最多可买 %d 股（<100股跳过）",
+                           stock, delta, max_affordable)
+        remaining = delta - submitted_buy
         if remaining >= 100:
+            logger.warning("【补单】%s 资金不够 缺 %d 股 已登记补单", stock, remaining)
             set_pending(state, stock, remaining, "cash_limited_or_unsubmitted", trade_date)
 
-    state["target_etfs"] = targets
-    state["target_weights"] = weights
-    state["pos_scale"] = pos_scale
-    state["last_rebalance_date"] = trade_date
-    state["last_window_process_date"] = trade_date
+    logger.info("阶段二完成")
     return True
 
 
+def has_active_sell_orders(state, broker):
+    """检查是否还有活跃卖单。"""
+    for key, order in state.get("order_book", {}).items():
+        if order.get("side") == "sell":
+            status = str(order.get("status", "")).lower()
+            if status in ("pending", "submitted", "partial_filled", "canceling", "partial_canceling", "unknown"):
+                return True
+    return False
+
+
 def process_rebalance_window(state, broker, trade_date, logger):
-    # 窗口内每个交易日只处理一次，避免重复调仓
+    # 窗口内每个交易日只处理一次
     if state.get("last_rebalance_date") == trade_date:
         return
-    if state.get("last_window_process_date") == trade_date:
+
+    phase = state.get("rebalance_phase")
+
+    if phase is None:
+        # 新调仓：先检查周期
+        if int(state.get("trade_day_counter", 0)) % REBALANCE_FREQ != 0:
+            state["last_window_process_date"] = trade_date
+            return
+
+        logger.info("进入调仓窗口（阶段一：卖）")
+        pos_scale = calculate_position_scale(broker, trade_date, logger)
+        targets, weights = compute_targets(broker, trade_date, state, logger)
+        if not targets:
+            logger.warning("目标为空，跳过调仓")
+            return
+
+        state["rebalance_targets"] = targets
+        state["rebalance_weights"] = weights
+        state["rebalance_pos_scale"] = pos_scale
+        state["pending_orders"] = {}
+
+        logger.info("目标持仓: %s", dict(zip(targets, weights)))
+        execute_sells(state, broker, targets, weights, pos_scale, trade_date, logger)
+        state["rebalance_phase"] = "sold_waiting"
+        state["sell_phase_start"] = time.time()
         return
 
-    if state.get("cooling_period_left", 0) > 0:
-        state["cooling_period_left"] = int(state.get("cooling_period_left", 0)) - 1
+    elif phase == "sold_waiting":
+        # 等待卖单成交
+        sync_and_archive_orders(state, broker, trade_date, logger)
+
+        if has_active_sell_orders(state, broker):
+            elapsed = time.time() - state.get("sell_phase_start", 0)
+            if elapsed < 120:
+                return
+            logger.warning("卖单等待超时 %.0fs，强制进入阶段二", elapsed)
+
+        logger.info("卖单已成交，进入阶段二：买")
+        targets = state.get("rebalance_targets", [])
+        weights = state.get("rebalance_weights", [])
+        pos_scale = state.get("rebalance_pos_scale", 1.0)
+
+        execute_buys(state, broker, targets, weights, pos_scale, trade_date, logger)
+
+        state["target_etfs"] = targets
+        state["target_weights"] = weights
+        state["pos_scale"] = pos_scale
+        state["rebalance_phase"] = None
+        state["last_rebalance_date"] = trade_date
         state["last_window_process_date"] = trade_date
-        logger.info("冷却期剩余 %s 天", state["cooling_period_left"])
-        return
-
-    if int(state.get("trade_day_counter", 0)) % REBALANCE_FREQ != 0:
-        state["last_window_process_date"] = trade_date
-        logger.info("非调仓周期，今日跳过调仓")
-        return
-
-    logger.info("进入调仓窗口")
-    pos_scale = calculate_position_scale(broker, trade_date, logger)
-    targets, weights = compute_targets(broker, trade_date, state, logger)
-    if not targets:
-        logger.warning("目标为空，跳过调仓")
-        return
-
-    state["pending_orders"] = {}
-    ok = execute_rebalance(state, broker, targets, weights, pos_scale, trade_date, logger)
-    if ok:
-        logger.info("调仓完成")
-    else:
-        logger.warning("调仓未完成，将允许后续窗口重试")
+        logger.info("两阶段调仓完成")
 
 
 def main():
@@ -547,6 +608,7 @@ def main():
     try:
         broker.connect()
         logger.info("miniQMT 连接成功")
+        broker.prepare_data(ALL_ETFS)
         broker.print_account_snapshot()
         startup_trade_date = today_str()
         log_startup_strategy_snapshot(state, broker, startup_trade_date, logger)
@@ -562,7 +624,7 @@ def main():
                 now = time.time()
                 log_trading_day_status_once_per_day(state, broker, trade_date, logger)
 
-                sync_and_archive_orders(state, broker, logger)
+                sync_and_archive_orders(state, broker, trade_date, logger)
 
                 total_asset = update_risk_baseline(state, broker, trade_date, logger)
                 if total_asset is None:
@@ -601,6 +663,14 @@ def main():
                     logger.info("心跳: 策略运行正常")
                     broker.print_account_snapshot()
                     last_heartbeat_time = now
+
+                # 每日收盘后增量更新历史数据（15:05 后执行一次）
+                if is_trading_day(broker, trade_date):
+                    now_hm = dt.datetime.now().strftime("%H:%M")
+                    if now_hm >= "15:05" and state.get("last_daily_download_date") != trade_date:
+                        broker.download_daily(ALL_ETFS)
+                        state["last_daily_download_date"] = trade_date
+                        logger.info("[%s] 收盘后数据更新完成", trade_date)
 
                 save_state_if_trading_day(state, broker, trade_date, logger)
                 time.sleep(LOOP_INTERVAL_SECONDS)
