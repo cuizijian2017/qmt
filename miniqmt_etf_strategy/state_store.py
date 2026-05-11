@@ -117,6 +117,8 @@ def save_state(state, logger, quiet=False, trade_date=None):
 
     state_file = build_state_file_path(trade_date)
     snapshot = copy.deepcopy(state)
+    # 仅剥离运行时计时器；rebalance_phase 与目标持仓保留用于崩溃恢复
+    snapshot.pop("sell_phase_start", None)
     snapshot["updated_at"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     tmp_file = state_file + ".tmp"

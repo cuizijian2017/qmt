@@ -5,8 +5,6 @@ import pandas as pd
 
 from config import (
     ALL_ETFS,
-    DEFENSE_ETFS,
-    DRAW_DOWN_LIMIT,
     EQUITY_ETFS,
     MA_WINDOW,
     MIN_HOLDINGS,
@@ -128,36 +126,3 @@ def compute_targets(market_data, current_date=None, state=None, logger=None):
     return selected.index.tolist(), [float(v / total) for v in selected.values]
 
 
-def update_risk_state(state, total_asset, current_date, logger):
-    if total_asset is None or total_asset <= 0:
-        return "account_error"
-
-    if state.get("risk_check_date") != current_date:
-        state["risk_check_date"] = current_date
-        state["day_start_equity"] = total_asset
-    elif state.get("day_start_equity") is None:
-        state["day_start_equity"] = total_asset
-
-    day_start = state.get("day_start_equity")
-    if day_start and total_asset < day_start * 0.85:
-        logger.error("[%s] 单日资产回撤超15%%，停止交易", current_date)
-        return "day_fuse"
-
-    watermark = state.get("watermark")
-    if watermark is None or total_asset > watermark:
-        state["watermark"] = total_asset
-        watermark = total_asset
-
-    drawdown = (total_asset - watermark) / watermark if watermark else 0
-    if drawdown < -DRAW_DOWN_LIMIT:
-        logger.error("[%s] 账户回撤 %.2f%% 破线，触发空仓保护", current_date, drawdown * 100)
-        state["in_lockdown"] = True
-        state["lockdown_days_left"] = 10
-        state["pending_orders"] = {}
-        return "lockdown"
-
-    return "ok"
-
-
-def is_defense_target(target_etfs):
-    return all(etf in DEFENSE_ETFS for etf in target_etfs)

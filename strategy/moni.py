@@ -560,15 +560,25 @@ def archive_final_orders(C, current_date):
         filled = int(order.get('filled', 0) or 0)
         remaining = int((volume - filled) / 100) * 100
         if side == 'buy' and remaining >= 100 and etf in getattr(C, 'target_etfs', []) and not getattr(C, 'in_lockdown', False):
+            # SIM 单从未成交过的不转补单（从未实际成交，只是被标记过期）
+            if filled <= 0 and str(order_id).startswith("SIM_"):
+                continue
             add_pending_order(C, etf, remaining, 'order_' + status, current_date, order_id)
             changed = True
     return changed
 
 
 def request_cancel_order(C, order_id, order):
-    """兼容不同 QMT 环境的撤单入口；找不到接口时只记录，不假装已撤。"""
+    """兼容不同 QMT 环境的撤单入口。"""
+    # SIM 合成单没有真实 order_id，直接标记过期
+    if str(order_id).startswith("SIM_") or str(order_id).startswith("BACKTEST_"):
+        order['cancel_requested'] = True
+        order['cancel_request_time'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        order['status'] = 'expired'
+        print('[撤单] 合成单直接标记过期: %s %s' % (order_id, order.get('etf')))
+        return True
+
     candidates = ['cancel', 'cancelorder', 'cancel_order']
-    last_error = ''
     for name in candidates:
         fn = globals().get(name)
         if fn is None:
@@ -588,13 +598,10 @@ def request_cancel_order(C, order_id, order):
                 order['status'] = 'canceling'
                 return True
             except TypeError as e:
-                last_error = str(e)
                 continue
             except Exception as e:
-                last_error = str(e)
                 break
-    order['cancel_error'] = last_error or 'cancel api not found'
-    print('[撤单失败] 未能提交撤单: %s, %s, %s' % (order_id, order.get('etf'), order.get('cancel_error')))
+    print('[撤单失败] 未能提交撤单: %s, %s' % (order_id, order.get('etf')))
     return False
 
 
@@ -612,6 +619,14 @@ def cancel_stale_orders(C, current_date, force=False):
             continue
         if order.get('cancel_requested') and str(order.get('status')).lower() in ('canceling', 'partial_canceling'):
             continue
+
+        # 跨日单直接标记过期，不等待超时
+        order_date = parse_order_time(order.get('time'))
+        if order_date and order_date.date() < datetime.datetime.now().date():
+            if request_cancel_order(C, order_id, order):
+                changed = True
+                continue
+
         submit_time = parse_order_time(order.get('time'))
         elapsed = (now - submit_time).total_seconds() if submit_time else timeout + 1
         if not force and elapsed < timeout:
@@ -878,7 +893,7 @@ def execute_buys(C, targets, weights, pos_scale, current_date):
             order_id = safe_order(C, 'buy', etf, buy_shares, remark)
             if order_id:
                 submitted_buy = buy_shares
-                available_cash -= buy_shares * price * 1.02
+                available_cash -= buy_shares * price  # 只用实际成本，不去 1.02 倍
 
         remaining = delta - submitted_buy
         if remaining >= 100:
@@ -998,7 +1013,7 @@ def execute_trades(C, current_date):
                 order_id = safe_order(C, 'buy', etf, buy_vol, remark)
                 if order_id:
                     submitted_buy = buy_vol
-                    available_cash -= buy_vol * price * 1.02
+                    available_cash -= buy_vol * price  # 只用实际成本
 
             remaining = delta - submitted_buy
             if remaining >= 100:
@@ -1063,7 +1078,7 @@ def execute_pending_orders(C, current_date):
                 order_id = safe_order(C, 'buy', etf, max_shares, '补单部分')
                 if order_id:
                     order["last_order_id"] = str(order_id)
-                    available_cash -= (max_shares * price * 1.02)
+                    available_cash -= max_shares * price  # 只用实际成本
                     order["shares"] -= max_shares
 
                 order["days"] = order.get("days", 0) + 1
@@ -1263,17 +1278,29 @@ def handlebar_simulation(C, current_date):
     except Exception:
         pass
 
-    # 2. 先撤掉超时订单（卖单等待阶段不撤，保护正在成交的卖单）
+    # per-bar guard（防止同一 bar 重复调仓）
+    if getattr(C, '_last_bar_date', None) != current_date:
+        C._last_bar_date = current_date
+        C._rebalance_done_for_bar = False
+
+    # 清理跨日残留单（不受 selling 阶段保护限制）
+    for _oid, _ord in list(getattr(C, 'order_book', {}).items()):
+        _ot = parse_order_time(_ord.get('time'))
+        if _ot and _ot.date() < datetime.datetime.now().date() and is_active_order_status(_ord.get('status')):
+            print('[清理] 跨日残留单: %s %s %s' % (_oid, _ord.get('side'), _ord.get('etf')))
+            request_cancel_order(C, _oid, _ord)
+
+    # 撤掉超时订单（卖单等待阶段不撤，保护正在成交的卖单）
     if getattr(C, 'rebalance_phase', None) != "selling":
         cancel_stale_orders(C, current_date)
 
-    # 3. 账户数据异常时直接停止
+    # 账户数据异常时直接停止
     now_val = get_total_value(C)
     if now_val is None:
         print('[%s] [账户异常] 无法获取账户总资产，停止本轮处理' % current_date)
         return
 
-    # 4. 每日资产熔断和回撤检查
+    # 每日资产熔断和回撤检查
     if getattr(C, 'risk_check_date', '') != current_date:
         C.risk_check_date = current_date
         C.day_start_equity = now_val if now_val > 0 else None
@@ -1297,7 +1324,7 @@ def handlebar_simulation(C, current_date):
             save_state(C)
             return
 
-    # 5. 空仓锁定期处理
+    # 空仓锁定期处理
     if C.in_lockdown:
         has_positions = submit_lockdown_liquidation(C, current_date)
         if has_positions:
@@ -1316,7 +1343,7 @@ def handlebar_simulation(C, current_date):
         save_state(C)
         return
 
-    # 6. 每日开盘补单处理
+    # 每日开盘补单处理
     if getattr(C, 'last_trade_date', '') != current_date:
         C.last_trade_date = current_date
         C.trade_day_counter += 1
@@ -1324,7 +1351,9 @@ def handlebar_simulation(C, current_date):
             execute_pending_orders(C, current_date)
         save_state(C)
 
-    # 7. 调仓时间窗口检查
+    # 调仓时间窗口检查 + per-bar 防护（同一根 bar 不重复执行）
+    if C._rebalance_done_for_bar:
+        return
     if not in_rebalance_window(C):
         return
     if getattr(C, 'last_rebalance_date', '') == current_date:
@@ -1332,7 +1361,7 @@ def handlebar_simulation(C, current_date):
     if getattr(C, 'last_window_process_date', '') == current_date:
         return
 
-    # 8. 冷却期检查
+    # 冷却期检查
     if C.cooling_period_left > 0:
         C.cooling_period_left -= 1
         C.last_window_process_date = current_date
@@ -1340,9 +1369,9 @@ def handlebar_simulation(C, current_date):
         save_state(C)
         return
 
-    # 9. 周期调仓过滤（测试模式：今日强制允许，原版 save_state+return 已注释）
+    # 周期调仓过滤（测试模式：今日强制允许，原版 save_state+return 已注释）
 
-    # 10. 两阶段调仓
+    # 两阶段调仓
     rebalance_phase = getattr(C, 'rebalance_phase', None)
 
     if rebalance_phase is None:
@@ -1371,6 +1400,12 @@ def handlebar_simulation(C, current_date):
         return
 
     elif rebalance_phase == "selling":
+        # 阶段二已完成防护：用 last_rebalance_date 做门禁（稳定可靠，不依赖自定义属性）
+        if getattr(C, 'last_rebalance_date', '') == current_date:
+            C.rebalance_phase = None
+            save_state(C)
+            return
+
         # 阶段一进行中：检查卖单是否成交完毕
         sync_order_book(C)
 
@@ -1389,5 +1424,6 @@ def handlebar_simulation(C, current_date):
         C.rebalance_phase = None
         C.last_rebalance_date = current_date
         C.last_window_process_date = current_date
+        C._rebalance_done_for_bar = True
         print('[%s] --- 两阶段调仓已完成 ---' % current_date)
         save_state(C)

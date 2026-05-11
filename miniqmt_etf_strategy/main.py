@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import datetime as dt
+import os
 import time
 import traceback
 
@@ -376,7 +377,7 @@ def execute_pending_orders(state, broker, trade_date, logger):
         remark = "补单完成" if buy_shares == shares else "补单部分"
         order_id = broker.order("buy", stock, buy_shares, remark)
         if order_id:
-            cash -= buy_shares * price * 1.02
+            cash -= buy_shares * price
             order["attempt_count"] = int(order.get("attempt_count", 0)) + 1
             order["last_order_id"] = str(order_id)
             order["last_attempt_time"] = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -515,7 +516,7 @@ def execute_buys(state, broker, targets, weights, pos_scale, trade_date, logger)
             order_id = broker.order("buy", stock, buy_shares, remark)
             if order_id:
                 submitted_buy = buy_shares
-                cash -= buy_shares * price * 1.02
+                cash -= buy_shares * price
             else:
                 logger.error("【失败】%s 下单失败，需手动买入 %d 股", stock, buy_shares)
         else:
@@ -546,6 +547,14 @@ def process_rebalance_window(state, broker, trade_date, logger):
         return
 
     phase = state.get("rebalance_phase")
+
+    # 跨日崩溃恢复：phase 残留但 last_rebalance_date 不是今天 → 昨天崩溃留下的
+    if phase == "sold_waiting" and state.get("last_rebalance_date") != trade_date:
+        logger.warning("检测到跨日残留调仓阶段（rebalance_phase=sold_waiting），重置为重新计算目标")
+        state["rebalance_phase"] = None
+        state["rebalance_targets"] = []
+        state["rebalance_weights"] = []
+        return
 
     if phase is None:
         # 新调仓：先检查周期
@@ -600,6 +609,16 @@ def process_rebalance_window(state, broker, trade_date, logger):
 def main():
     logger = setup_logger()
     logger.info("策略程序启动")
+
+    # 写入 PID 文件供 force_rebalance.bat 精确杀进程
+    _pid_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bat_ops", "strategy.pid")
+    try:
+        os.makedirs(os.path.dirname(_pid_file), exist_ok=True)
+        with open(_pid_file, "w") as _f:
+            _f.write(str(os.getpid()))
+        logger.info("PID 文件已写入: %s", _pid_file)
+    except Exception as _e:
+        logger.warning("PID 文件写入失败: %s", _e)
 
     state = load_state(logger)
     broker = QmtBroker(logger, state)
@@ -696,6 +715,12 @@ def main():
         except Exception:
             logger.error("退出前保存状态失败")
             logger.error(traceback.format_exc())
+        try:
+            if os.path.exists(_pid_file):
+                os.remove(_pid_file)
+                logger.info("PID 文件已清理")
+        except Exception:
+            pass
         broker.stop()
         logger.info("策略程序退出")
 

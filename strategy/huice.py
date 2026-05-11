@@ -784,7 +784,7 @@ def execute_buys(C, targets, weights, pos_scale, current_date):
             order_id = safe_order(C, 'buy', etf, buy_shares, remark)
             if order_id:
                 submitted_buy = buy_shares
-                available_cash -= buy_shares * price * 1.02
+                available_cash -= buy_shares * price
         remaining = delta - submitted_buy
         if remaining >= 100:
             add_pending_order(C, etf, remaining, 'cash_limited_or_unsubmitted', current_date)
@@ -901,7 +901,7 @@ def execute_trades(C, current_date):
                 order_id = safe_order(C, 'buy', etf, buy_vol, remark)
                 if order_id:
                     submitted_buy = buy_vol
-                    available_cash -= buy_vol * price * 1.02
+                    available_cash -= buy_vol * price
 
             remaining = delta - submitted_buy
             if remaining >= 100:
@@ -966,7 +966,7 @@ def execute_pending_orders(C, current_date):
                 order_id = safe_order(C, 'buy', etf, max_shares, '补单部分')
                 if order_id:
                     order["last_order_id"] = str(order_id)
-                    available_cash -= (max_shares * price * 1.02)
+                    available_cash -= max_shares * price
                     order["shares"] -= max_shares
 
                 order["days"] = order.get("days", 0) + 1
