@@ -629,6 +629,30 @@ def main():
         logger.info("miniQMT 连接成功")
         broker.prepare_data(ALL_ETFS)
         broker.print_account_snapshot()
+
+        # 启动数据可用性检测
+        _data_ok = False
+        for _retry in range(10):
+            _pass = []
+            _fail = []
+            for _etf in ALL_ETFS:
+                _p = broker.get_latest_price(_etf, require_tick=False)
+                if _p > 0:
+                    _pass.append(_etf)
+                else:
+                    _fail.append(_etf)
+            logger.info("[启动检测] 数据可用: %d/%d 只 ETF 可取到价格", len(_pass), len(ALL_ETFS))
+            if _pass:
+                logger.info("[启动检测] ✅ 通过: %s", ", ".join(_pass))
+                if _fail:
+                    logger.warning("[启动检测] ⚠️ 失败: %s", ", ".join(_fail))
+                _data_ok = True
+                break
+            logger.warning("[启动检测] ❌ 所有 ETF 均无数据，等待 3 秒后重试 (%d/10)", _retry + 1)
+            time.sleep(3)
+        if not _data_ok:
+            logger.error("[启动检测] 行情数据获取失败，策略将继续运行但可能跳过调仓")
+
         startup_trade_date = today_str()
         log_startup_strategy_snapshot(state, broker, startup_trade_date, logger)
         if save_state_if_trading_day(state, broker, startup_trade_date, logger, quiet=False):

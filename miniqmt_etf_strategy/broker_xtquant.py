@@ -256,6 +256,14 @@ class QmtBroker:
                         pass
                 except Exception:
                     pass
+
+        # 等待数据下载完成：最多等 30 秒，确认至少有一只 ETF 能取到行情
+        for _wait in range(30):
+            test = self.get_close_history(stock_list[:1], 2)
+            if test:
+                break
+            time.sleep(1)
+
         self.logger.info("数据准备完成: 已下载历史并订阅 %d 只 ETF", len(stock_list))
 
     def download_daily(self, stock_list):
